@@ -20,6 +20,10 @@ pub enum FrameType {
     KeyframeRequest = 0x02,
     /// 统计信息（双向）
     Stats = 0x03,
+    /// 显示器列表 (服务端 → 客户端)
+    MonitorList = 0x04,
+    /// 选择显示器 (客户端 → 服务端)
+    MonitorSelect = 0x05,
     /// 心跳包
     Ping = 0x10,
     Pong = 0x11,
@@ -66,6 +70,8 @@ impl FrameHeader {
             0x01 => FrameType::VideoFrame,
             0x02 => FrameType::KeyframeRequest,
             0x03 => FrameType::Stats,
+            0x04 => FrameType::MonitorList,
+            0x05 => FrameType::MonitorSelect,
             0x10 => FrameType::Ping,
             0x11 => FrameType::Pong,
             _ => return None,

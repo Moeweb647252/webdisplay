@@ -13,6 +13,15 @@ pub struct DdaCapture {
     staging_texture: ID3D11Texture2D,
 }
 
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct MonitorInfo {
+    pub index: u32,
+    pub name: String,
+    pub width: u32,
+    pub height: u32,
+    pub primary: bool,
+}
+
 /// 捕获到的帧数据
 pub struct CapturedFrame {
     pub data: Vec<u8>,
@@ -20,12 +29,73 @@ pub struct CapturedFrame {
 }
 
 impl DdaCapture {
+    /// 枚举所有连接的显示器
+    pub fn enumerate_monitors() -> Result<Vec<MonitorInfo>, Box<dyn std::error::Error>> {
+        let mut monitors = Vec::new();
+        unsafe {
+            // 创建一个用于枚举的临时设备
+            let mut device = None;
+            let feature_levels = [D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0];
+
+            if D3D11CreateDevice(
+                None,
+                D3D_DRIVER_TYPE_HARDWARE,
+                windows::Win32::Foundation::HMODULE::default(),
+                D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+                Some(&feature_levels),
+                D3D11_SDK_VERSION,
+                Some(&mut device),
+                None,
+                None,
+            )
+            .is_err()
+            {
+                return Ok(monitors);
+            }
+
+            if let Some(device) = device {
+                let dxgi_device: IDXGIDevice = device.cast()?;
+                let adapter = dxgi_device.GetAdapter()?;
+
+                let mut index = 0;
+                while let Ok(output) = adapter.EnumOutputs(index) {
+                    if let Ok(desc) = output.GetDesc() {
+                        let width =
+                            (desc.DesktopCoordinates.right - desc.DesktopCoordinates.left) as u32;
+                        let height =
+                            (desc.DesktopCoordinates.bottom - desc.DesktopCoordinates.top) as u32;
+                        let primary =
+                            desc.DesktopCoordinates.left == 0 && desc.DesktopCoordinates.top == 0;
+
+                        // Parse utf-16 device name
+                        let name_len = desc
+                            .DeviceName
+                            .iter()
+                            .position(|&c| c == 0)
+                            .unwrap_or(desc.DeviceName.len());
+                        let name = String::from_utf16_lossy(&desc.DeviceName[..name_len]);
+
+                        monitors.push(MonitorInfo {
+                            index,
+                            name,
+                            width,
+                            height,
+                            primary,
+                        });
+                    }
+                    index += 1;
+                }
+            }
+        }
+        Ok(monitors)
+    }
+
     /// 初始化 DDA 捕获
     ///
     /// 延迟关键设计：
     /// - 使用 D3D11_CREATE_DEVICE_VIDEO_SUPPORT 标志以获得硬件加速支持
     /// - Staging 纹理预分配，避免运行时内存分配
-    pub fn new() -> Result<Self, Box<dyn std::error::Error>> {
+    pub fn new(monitor_index: u32) -> Result<Self, Box<dyn std::error::Error>> {
         unsafe {
             // 创建 D3D11 设备
             let mut device = None;
@@ -50,7 +120,7 @@ impl DdaCapture {
             // 获取 DXGI 适配器和输出
             let dxgi_device: IDXGIDevice = device.cast()?;
             let adapter = dxgi_device.GetAdapter()?;
-            let output: IDXGIOutput = adapter.EnumOutputs(0)?;
+            let output: IDXGIOutput = adapter.EnumOutputs(monitor_index)?;
             let output1: IDXGIOutput1 = output.cast()?;
 
             // 获取输出描述以得到分辨率

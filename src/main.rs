@@ -33,8 +33,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let force_keyframe = Arc::new(AtomicBool::new(false));
     let force_kf_clone = force_keyframe.clone();
 
+    // 显示器切换通道
+    let (monitor_switch_tx, monitor_switch_rx) = mpsc::channel::<u32>(8);
+
+    // 获取并序列化初始显示器列表
+    let monitors = DdaCapture::enumerate_monitors().unwrap_or_default();
+    for m in &monitors {
+        log::info!(
+            "发现显示器 {}: {} ({}x{}){}",
+            m.index,
+            m.name,
+            m.width,
+            m.height,
+            if m.primary { " [主屏]" } else { "" }
+        );
+    }
+    let monitor_list_json = Arc::new(serde_json::to_vec(&monitors).unwrap_or_default());
+
     // 初始化 WebSocket 服务器
-    let (ws_server, _frame_tx) = WebSocketServer::new(keyframe_tx);
+    let (ws_server, _frame_tx) =
+        WebSocketServer::new(keyframe_tx, monitor_switch_tx, monitor_list_json);
     let ws_server = Arc::new(ws_server);
 
     // 启动关键帧请求监听
@@ -73,7 +91,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let encode_handle = std::thread::Builder::new()
         .name("capture-encode".into())
         .spawn(move || {
-            if let Err(e) = capture_encode_loop(ws_server_encode, force_keyframe) {
+            if let Err(e) = capture_encode_loop(ws_server_encode, force_keyframe, monitor_switch_rx)
+            {
                 log::error!("Capture/Encode thread error: {}", e);
             }
         })?;
@@ -95,14 +114,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 fn capture_encode_loop(
     ws_server: Arc<WebSocketServer>,
     force_keyframe: Arc<AtomicBool>,
+    mut monitor_switch_rx: mpsc::Receiver<u32>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // 初始显示器索引
+    let mut current_monitor_index = 0;
+
     // 初始化捕获器
-    let mut capturer = DdaCapture::new()?;
-    let width = capturer.width();
-    let height = capturer.height();
+    let mut capturer = DdaCapture::new(current_monitor_index)?;
+    let mut width = capturer.width();
+    let mut height = capturer.height();
 
     // 初始化编码器
-    let config = EncoderConfig {
+    let mut config = EncoderConfig {
         width,
         height,
         fps: TARGET_FPS,
@@ -119,6 +142,34 @@ fn capture_encode_loop(
     log::info!("捕获-编码循环启动: {}x{} @{}fps", width, height, TARGET_FPS);
 
     loop {
+        // 处理显示器切换请求
+        if let Ok(new_index) = monitor_switch_rx.try_recv() {
+            if new_index != current_monitor_index {
+                log::info!("正在切换显示器到索引 {}", new_index);
+                match DdaCapture::new(new_index) {
+                    Ok(new_capturer) => {
+                        capturer = new_capturer;
+                        current_monitor_index = new_index;
+                        width = capturer.width();
+                        height = capturer.height();
+
+                        config.width = width;
+                        config.height = height;
+
+                        match Av1AmfEncoder::new(&config) {
+                            Ok(new_encoder) => {
+                                encoder = new_encoder;
+                                force_keyframe.store(true, Ordering::Relaxed);
+                                log::info!("显示器切换成功：{}x{}", width, height);
+                            }
+                            Err(e) => log::error!("切换显示器后初始化编码器失败: {}", e),
+                        }
+                    }
+                    Err(e) => log::error!("切换显示器失败: {}", e),
+                }
+            }
+        }
+
         let frame_start = Instant::now();
 
         // Check if we need to force a keyframe

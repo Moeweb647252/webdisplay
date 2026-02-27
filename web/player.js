@@ -12,8 +12,11 @@ const HEADER_SIZE = 16;
 // 帧类型
 const FRAME_TYPE = {
     VIDEO: 0x01,
+    VIDEO: 0x01,
     KEYFRAME_REQUEST: 0x02,
     STATS: 0x03,
+    MONITOR_LIST: 0x04,
+    MONITOR_SELECT: 0x05,
     PING: 0x10,
     PONG: 0x11,
 };
@@ -30,6 +33,8 @@ class UltraLowLatencyPlayer {
         this.ctx = this.canvas.getContext('2d');
         this.overlay = document.getElementById('overlay');
         this.statusEl = document.getElementById('connection-status');
+        this.monitorPicker = document.getElementById('monitor-picker');
+        this.monitorListEl = document.getElementById('monitor-list');
 
         this.decoder = null;
         this.ws = null;
@@ -78,11 +83,14 @@ class UltraLowLatencyPlayer {
         requestAnimationFrame(this.renderBound);
         this._startStatsUpdate();
 
-        // 按 Tab 切换 overlay 显示
+        // 按 Tab 切换 overlay 显示, 按 M 切换显示器选择
         document.addEventListener('keydown', (e) => {
             if (e.key === 'Tab') {
                 e.preventDefault();
                 this.overlay.classList.toggle('hidden');
+            } else if (e.key.toLowerCase() === 'm') {
+                e.preventDefault();
+                this.monitorPicker.classList.toggle('hidden');
             }
         });
     }
@@ -173,10 +181,22 @@ class UltraLowLatencyPlayer {
         const pts = view.getUint32(6, true);
         const payloadLen = view.getUint32(10, true);
 
+        const payload = new Uint8Array(data, HEADER_SIZE, payloadLen);
+
+        if (frameType === FRAME_TYPE.MONITOR_LIST) {
+            try {
+                const jsonStr = new TextDecoder().decode(payload);
+                const monitors = JSON.parse(jsonStr);
+                this._updateMonitorList(monitors);
+            } catch (e) {
+                console.error("解析显示器列表失败", e);
+            }
+            return;
+        }
+
         if (frameType !== FRAME_TYPE.VIDEO) return;
 
         const isKeyframe = (flags & FRAME_FLAGS.KEYFRAME) !== 0;
-        const payload = new Uint8Array(data, HEADER_SIZE, payloadLen);
 
         // 统计码率
         this.stats.bitrateBytes += data.byteLength;
@@ -263,6 +283,76 @@ class UltraLowLatencyPlayer {
         view.setUint8(0, FRAME_TYPE.KEYFRAME_REQUEST);
         this.ws.send(header);
         console.log('已请求关键帧');
+    }
+
+    /**
+     * 更新显示器列表 UI
+     */
+    _updateMonitorList(monitors) {
+        this.monitorListEl.innerHTML = '';
+        if (!monitors || monitors.length === 0) {
+            this.monitorListEl.innerHTML = '<div style="color:#888; text-align:center;">未检测到显示器</div>';
+            return;
+        }
+
+        monitors.forEach(m => {
+            const card = document.createElement('div');
+            card.className = 'monitor-card';
+
+            const info = document.createElement('div');
+            info.className = 'monitor-info';
+
+            const name = document.createElement('div');
+            name.className = 'monitor-name';
+            name.textContent = `显示器 ${m.index}: ${m.name} ${m.primary ? '(主屏)' : ''}`;
+
+            const res = document.createElement('div');
+            res.className = 'monitor-res';
+            res.textContent = `${m.width} x ${m.height}`;
+
+            info.appendChild(name);
+            info.appendChild(res);
+
+            const btn = document.createElement('button');
+            btn.textContent = '切换';
+            btn.style.cssText = 'background:#4fc3f7; color:#000; border:none; border-radius:4px; padding:6px 12px; cursor:pointer; font-weight:500;';
+
+            // 点击切换显示器
+            card.onclick = () => {
+                this._requestMonitorSwitch(m.index);
+            };
+
+            card.appendChild(info);
+            card.appendChild(btn);
+            this.monitorListEl.appendChild(card);
+        });
+    }
+
+    /**
+     * 请求切换显示器
+     */
+    _requestMonitorSwitch(index) {
+        if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+
+        const req = { index };
+        const payloadJson = JSON.stringify(req);
+        const payload = new TextEncoder().encode(payloadJson);
+
+        const header = new ArrayBuffer(HEADER_SIZE);
+        const view = new DataView(header);
+        view.setUint8(0, FRAME_TYPE.MONITOR_SELECT);
+        view.setUint32(10, payload.byteLength, true); // payload_len
+
+        const packet = new Uint8Array(HEADER_SIZE + payload.byteLength);
+        packet.set(new Uint8Array(header), 0);
+        packet.set(payload, HEADER_SIZE);
+
+        this.ws.send(packet.buffer);
+        console.log('已请求切换显示器到', index);
+
+        // 隐藏面板并请求关键帧加速画面出现
+        this.monitorPicker.classList.add('hidden');
+        this._requestKeyframe();
     }
 
     /**

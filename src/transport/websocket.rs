@@ -19,11 +19,17 @@ pub struct WebSocketServer {
     frame_tx: broadcast::Sender<Arc<Vec<u8>>>,
     /// 关键帧请求回调
     keyframe_request_tx: tokio::sync::mpsc::Sender<()>,
+    /// 显示器切换请求回调
+    monitor_switch_tx: tokio::sync::mpsc::Sender<u32>,
+    /// 缓存的显示器列表 JSON 数据
+    monitor_list_json: Arc<Vec<u8>>,
 }
 
 impl WebSocketServer {
     pub fn new(
         keyframe_request_tx: tokio::sync::mpsc::Sender<()>,
+        monitor_switch_tx: tokio::sync::mpsc::Sender<u32>,
+        monitor_list_json: Arc<Vec<u8>>,
     ) -> (Self, broadcast::Sender<Arc<Vec<u8>>>) {
         // 缓冲区大小：保留最近 4 帧，旧帧直接丢弃
         let (frame_tx, _) = broadcast::channel::<Arc<Vec<u8>>>(4);
@@ -33,6 +39,8 @@ impl WebSocketServer {
             Self {
                 frame_tx,
                 keyframe_request_tx,
+                monitor_switch_tx,
+                monitor_list_json,
             },
             tx_clone,
         )
@@ -54,6 +62,8 @@ impl WebSocketServer {
 
             let frame_rx = self.frame_tx.subscribe();
             let keyframe_tx = self.keyframe_request_tx.clone();
+            let monitor_switch_tx = self.monitor_switch_tx.clone();
+            let monitor_list = self.monitor_list_json.clone();
 
             tokio::spawn(async move {
                 let _ = stream.set_nodelay(true);
@@ -64,7 +74,15 @@ impl WebSocketServer {
                         return;
                     }
                 };
-                if let Err(e) = Self::handle_client(stream, frame_rx, keyframe_tx, peer_addr).await
+                if let Err(e) = Self::handle_client(
+                    stream,
+                    frame_rx,
+                    keyframe_tx,
+                    monitor_switch_tx,
+                    monitor_list,
+                    peer_addr,
+                )
+                .await
                 {
                     log::warn!("客户端 {} 断开: {}", peer_addr, e);
                 }
@@ -77,12 +95,30 @@ impl WebSocketServer {
         stream: tokio_rustls::server::TlsStream<TcpStream>,
         mut frame_rx: broadcast::Receiver<Arc<Vec<u8>>>,
         keyframe_tx: tokio::sync::mpsc::Sender<()>,
+        monitor_switch_tx: tokio::sync::mpsc::Sender<u32>,
+        monitor_list_json: Arc<Vec<u8>>,
         peer_addr: SocketAddr,
     ) -> Result<(), Box<dyn std::error::Error>> {
         // 禁用 Nagle 算法已经在 acceptor.accept 前处理
 
         let ws_stream = tokio_tungstenite::accept_async(stream).await?;
         let (mut ws_sender, mut ws_receiver) = ws_stream.split();
+
+        // 建立连接后立即发送显示器列表
+        let header = FrameHeader {
+            frame_type: FrameType::MonitorList,
+            flags: FrameFlags::empty(),
+            sequence: 0,
+            pts: 0,
+            payload_len: monitor_list_json.len() as u32,
+        };
+        let mut packet = Vec::with_capacity(FrameHeader::SIZE + monitor_list_json.len());
+        packet.extend_from_slice(&header.to_bytes());
+        packet.extend_from_slice(&monitor_list_json);
+        if let Err(e) = ws_sender.send(Message::Binary(packet.into())).await {
+            log::warn!("发送初始显示器列表失败: {}", e);
+            return Ok(());
+        }
 
         // 发送任务：将编码帧推送给客户端
         let keyframe_tx1 = keyframe_tx.clone();
@@ -131,6 +167,27 @@ impl WebSocketServer {
                             if header.frame_type == FrameType::KeyframeRequest {
                                 log::info!("客户端 {} 请求关键帧", peer_addr);
                                 let _ = keyframe_tx2.send(()).await;
+                            } else if header.frame_type == FrameType::MonitorSelect {
+                                let start = FrameHeader::SIZE;
+                                let end = start + header.payload_len as usize;
+                                if data.len() >= end {
+                                    if let Ok(json) = std::str::from_utf8(&data[start..end]) {
+                                        if let Ok(val) =
+                                            serde_json::from_str::<serde_json::Value>(json)
+                                        {
+                                            if let Some(index) =
+                                                val.get("index").and_then(|v| v.as_u64())
+                                            {
+                                                log::info!(
+                                                    "客户端 {} 请求切换屏幕到 {}",
+                                                    peer_addr,
+                                                    index
+                                                );
+                                                let _ = monitor_switch_tx.send(index as u32).await;
+                                            }
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
