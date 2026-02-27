@@ -1,0 +1,351 @@
+    Checking webdisplay v0.1.0 (C:\Users\Misaka\Code\webdisplay)
+warning: unused import: `std::ptr`
+ --> src\capture\dda.rs:1:5
+  |
+1 | use std::ptr;
+  |     ^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `Duration`
+ --> src\capture\dda.rs:2:17
+  |
+2 | use std::time::{Duration, Instant};
+  |                 ^^^^^^^^
+
+warning: unused import: `encoder`
+ --> src\encode\av1_amf.rs:2:32
+  |
+2 | use ffmpeg_next::codec::{self, encoder};
+  |                                ^^^^^^^
+
+warning: unused doc comment
+  --> src\protocol\frame.rs:28:1
+   |
+28 | /// 帧标志位
+   | ^^^^^^^^^^^^ rustdoc does not generate documentation for macro invocations
+   |
+   = help: to document an item produced by a macro, the macro must produce the documentation as part of its expansion
+   = note: `#[warn(unused_doc_comments)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `Mutex`
+ --> src\transport\websocket.rs:6:19
+  |
+6 | use tokio::sync::{Mutex, broadcast};
+  |                   ^^^^^
+
+error[E0382]: borrow of moved value: `keyframe_tx`
+   --> src\transport\websocket.rs:110:28
+    |
+ 66 |         keyframe_tx: tokio::sync::mpsc::Sender<()>,
+    |         ----------- move occurs because `keyframe_tx` has type `tokio::sync::mpsc::Sender<()>`, which does not implement the `Copy` trait
+...
+ 76 |         let send_task = tokio::spawn(async move {
+    |                                      ---------- value moved here
+...
+ 79 |             loop {
+    |             ---- inside of this loop
+...
+102 |                         let _ = keyframe_tx.send(()).await;
+    |                                 ----------- variable moved due to use in coroutine
+...
+110 |         let keyframe_tx2 = keyframe_tx.clone();
+    |                            ^^^^^^^^^^^ value borrowed here after move
+    |
+help: consider cloning the value before moving it into the closure
+    |
+ 76 ~         let value = keyframe_tx.clone();
+ 77 ~         let send_task = tokio::spawn(async move {
+ 78 |             let mut last_keyframe_data: Option<Arc<Vec<u8>>> = None;
+...
+102 |                         // 请求关键帧以便重新同步
+103 ~                         let _ = value.send(()).await;
+    |
+
+error[E0061]: this method takes 0 arguments but 1 argument was supplied
+    --> src\capture\dda.rs:64:20
+     |
+  64 |             output.GetDesc(&mut desc)?;
+     |                    ^^^^^^^ --------- unexpected argument of type `&mut Dxgi::DXGI_OUTPUT_DESC`
+     |
+note: method defined here
+    --> C:\Users\Misaka\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\windows-0.62.2\src\Windows\Win32\Graphics\Dxgi\mod.rs:4084:19
+     |
+4084 |     pub unsafe fn GetDesc(&self) -> windows_core::Result<DXGI_OUTPUT_DESC> {
+     |                   ^^^^^^^
+help: remove the extra argument
+     |
+  64 -             output.GetDesc(&mut desc)?;
+  64 +             output.GetDesc()?;
+     |
+
+error[E0277]: `?` couldn't convert the error: `dyn StdError: std::marker::Send` is not satisfied
+   --> src\main.rs:90:41
+    |
+ 88 | ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    |      ---------------------------------------------------- required `dyn StdError: std::marker::Send` because of this
+ 89 |     // 初始化捕获器
+ 90 |     let mut capturer = DdaCapture::new()?;
+    |                        -----------------^ `dyn StdError` cannot be sent between threads safely
+    |                        |
+    |                        this can't be annotated with `?` because it has type `Result<_, Box<(dyn StdError + 'static)>>`
+    |
+    = help: the trait `std::marker::Send` is not implemented for `dyn StdError`
+    = note: the question mark operation (`?`) implicitly performs a conversion on the error value using the `From` trait
+    = note: required for `std::ptr::Unique<dyn StdError>` to implement `std::marker::Send`
+note: required because it appears within the type `Box<dyn StdError>`
+   --> C:\Users\Misaka\.rustup\toolchains\stable-x86_64-pc-windows-msvc\lib/rustlib/src/rust\library\alloc\src\boxed.rs:234:12
+    |
+234 | pub struct Box<
+    |            ^^^
+    = note: required for `Box<dyn StdError + std::marker::Send + Sync>` to implement `From<Box<dyn StdError>>`
+
+error[E0277]: `?` couldn't convert the error: `dyn StdError: Sync` is not satisfied
+   --> src\main.rs:90:41
+    |
+ 88 | ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    |      ---------------------------------------------------- required `dyn StdError: Sync` because of this
+ 89 |     // 初始化捕获器
+ 90 |     let mut capturer = DdaCapture::new()?;
+    |                        -----------------^ `dyn StdError` cannot be shared between threads safely
+    |                        |
+    |                        this can't be annotated with `?` because it has type `Result<_, Box<(dyn StdError + 'static)>>`
+    |
+    = help: the trait `Sync` is not implemented for `dyn StdError`
+    = note: the question mark operation (`?`) implicitly performs a conversion on the error value using the `From` trait
+    = note: required for `std::ptr::Unique<dyn StdError>` to implement `Sync`
+note: required because it appears within the type `Box<dyn StdError>`
+   --> C:\Users\Misaka\.rustup\toolchains\stable-x86_64-pc-windows-msvc\lib/rustlib/src/rust\library\alloc\src\boxed.rs:234:12
+    |
+234 | pub struct Box<
+    |            ^^^
+    = note: required for `Box<dyn StdError + std::marker::Send + Sync>` to implement `From<Box<dyn StdError>>`
+
+error[E0277]: `?` couldn't convert the error: `dyn StdError: Sized` is not satisfied
+  --> src\main.rs:90:41
+   |
+88 | ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+   |      ---------------------------------------------------- required `dyn StdError: Sized` because of this
+89 |     // 初始化捕获器
+90 |     let mut capturer = DdaCapture::new()?;
+   |                        -----------------^ doesn't have a size known at compile-time
+   |                        |
+   |                        this can't be annotated with `?` because it has type `Result<_, Box<(dyn StdError + 'static)>>`
+   |
+   = help: the trait `Sized` is not implemented for `dyn StdError`
+   = note: the question mark operation (`?`) implicitly performs a conversion on the error value using the `From` trait
+   = note: required for `Box<dyn StdError>` to implement `StdError`
+   = note: required for `Box<dyn StdError + std::marker::Send + Sync>` to implement `From<Box<dyn StdError>>`
+
+error[E0277]: `?` couldn't convert the error: `dyn StdError: std::marker::Send` is not satisfied
+   --> src\main.rs:102:50
+    |
+ 88 | ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    |      ---------------------------------------------------- required `dyn StdError: std::marker::Send` because of this
+...
+102 |     let mut encoder = Av1AmfEncoder::new(&config)?;
+    |                       ---------------------------^ `dyn StdError` cannot be sent between threads safely
+    |                       |
+    |                       this can't be annotated with `?` because it has type `Result<_, Box<(dyn StdError + 'static)>>`
+    |
+    = help: the trait `std::marker::Send` is not implemented for `dyn StdError`
+    = note: the question mark operation (`?`) implicitly performs a conversion on the error value using the `From` trait
+    = note: required for `std::ptr::Unique<dyn StdError>` to implement `std::marker::Send`
+note: required because it appears within the type `Box<dyn StdError>`
+   --> C:\Users\Misaka\.rustup\toolchains\stable-x86_64-pc-windows-msvc\lib/rustlib/src/rust\library\alloc\src\boxed.rs:234:12
+    |
+234 | pub struct Box<
+    |            ^^^
+    = note: required for `Box<dyn StdError + std::marker::Send + Sync>` to implement `From<Box<dyn StdError>>`
+
+error[E0277]: `?` couldn't convert the error: `dyn StdError: Sync` is not satisfied
+   --> src\main.rs:102:50
+    |
+ 88 | ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    |      ---------------------------------------------------- required `dyn StdError: Sync` because of this
+...
+102 |     let mut encoder = Av1AmfEncoder::new(&config)?;
+    |                       ---------------------------^ `dyn StdError` cannot be shared between threads safely
+    |                       |
+    |                       this can't be annotated with `?` because it has type `Result<_, Box<(dyn StdError + 'static)>>`
+    |
+    = help: the trait `Sync` is not implemented for `dyn StdError`
+    = note: the question mark operation (`?`) implicitly performs a conversion on the error value using the `From` trait
+    = note: required for `std::ptr::Unique<dyn StdError>` to implement `Sync`
+note: required because it appears within the type `Box<dyn StdError>`
+   --> C:\Users\Misaka\.rustup\toolchains\stable-x86_64-pc-windows-msvc\lib/rustlib/src/rust\library\alloc\src\boxed.rs:234:12
+    |
+234 | pub struct Box<
+    |            ^^^
+    = note: required for `Box<dyn StdError + std::marker::Send + Sync>` to implement `From<Box<dyn StdError>>`
+
+error[E0277]: `?` couldn't convert the error: `dyn StdError: Sized` is not satisfied
+   --> src\main.rs:102:50
+    |
+ 88 | ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    |      ---------------------------------------------------- required `dyn StdError: Sized` because of this
+...
+102 |     let mut encoder = Av1AmfEncoder::new(&config)?;
+    |                       ---------------------------^ doesn't have a size known at compile-time
+    |                       |
+    |                       this can't be annotated with `?` because it has type `Result<_, Box<(dyn StdError + 'static)>>`
+    |
+    = help: the trait `Sized` is not implemented for `dyn StdError`
+    = note: the question mark operation (`?`) implicitly performs a conversion on the error value using the `From` trait
+    = note: required for `Box<dyn StdError>` to implement `StdError`
+    = note: required for `Box<dyn StdError + std::marker::Send + Sync>` to implement `From<Box<dyn StdError>>`
+
+error[E0277]: `?` couldn't convert the error: `dyn StdError: std::marker::Send` is not satisfied
+   --> src\main.rs:126:56
+    |
+ 88 | ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    |      ---------------------------------------------------- required `dyn StdError: std::marker::Send` because of this
+...
+126 |         let captured = match capturer.capture_frame(16)? {
+    |                                       -----------------^ `dyn StdError` cannot be sent between threads safely
+    |                                       |
+    |                                       this can't be annotated with `?` because it has type `Result<_, Box<(dyn StdError + 'static)>>`
+    |
+    = help: the trait `std::marker::Send` is not implemented for `dyn StdError`
+    = note: the question mark operation (`?`) implicitly performs a conversion on the error value using the `From` trait
+    = note: required for `std::ptr::Unique<dyn StdError>` to implement `std::marker::Send`
+note: required because it appears within the type `Box<dyn StdError>`
+   --> C:\Users\Misaka\.rustup\toolchains\stable-x86_64-pc-windows-msvc\lib/rustlib/src/rust\library\alloc\src\boxed.rs:234:12
+    |
+234 | pub struct Box<
+    |            ^^^
+    = note: required for `Box<dyn StdError + std::marker::Send + Sync>` to implement `From<Box<dyn StdError>>`
+
+error[E0277]: `?` couldn't convert the error: `dyn StdError: Sync` is not satisfied
+   --> src\main.rs:126:56
+    |
+ 88 | ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    |      ---------------------------------------------------- required `dyn StdError: Sync` because of this
+...
+126 |         let captured = match capturer.capture_frame(16)? {
+    |                                       -----------------^ `dyn StdError` cannot be shared between threads safely
+    |                                       |
+    |                                       this can't be annotated with `?` because it has type `Result<_, Box<(dyn StdError + 'static)>>`
+    |
+    = help: the trait `Sync` is not implemented for `dyn StdError`
+    = note: the question mark operation (`?`) implicitly performs a conversion on the error value using the `From` trait
+    = note: required for `std::ptr::Unique<dyn StdError>` to implement `Sync`
+note: required because it appears within the type `Box<dyn StdError>`
+   --> C:\Users\Misaka\.rustup\toolchains\stable-x86_64-pc-windows-msvc\lib/rustlib/src/rust\library\alloc\src\boxed.rs:234:12
+    |
+234 | pub struct Box<
+    |            ^^^
+    = note: required for `Box<dyn StdError + std::marker::Send + Sync>` to implement `From<Box<dyn StdError>>`
+
+error[E0277]: `?` couldn't convert the error: `dyn StdError: Sized` is not satisfied
+   --> src\main.rs:126:56
+    |
+ 88 | ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    |      ---------------------------------------------------- required `dyn StdError: Sized` because of this
+...
+126 |         let captured = match capturer.capture_frame(16)? {
+    |                                       -----------------^ doesn't have a size known at compile-time
+    |                                       |
+    |                                       this can't be annotated with `?` because it has type `Result<_, Box<(dyn StdError + 'static)>>`
+    |
+    = help: the trait `Sized` is not implemented for `dyn StdError`
+    = note: the question mark operation (`?`) implicitly performs a conversion on the error value using the `From` trait
+    = note: required for `Box<dyn StdError>` to implement `StdError`
+    = note: required for `Box<dyn StdError + std::marker::Send + Sync>` to implement `From<Box<dyn StdError>>`
+
+error[E0277]: `?` couldn't convert the error: `dyn StdError: std::marker::Send` is not satisfied
+   --> src\main.rs:132:77
+    |
+ 88 | ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    |      ---------------------------------------------------- required `dyn StdError: std::marker::Send` because of this
+...
+132 |         let encoded_frames = encoder.encode(&captured.data, captured.stride)?;
+    |                                      ---------------------------------------^ `dyn StdError` cannot be sent between threads safely
+    |                                      |
+    |                                      this can't be annotated with `?` because it has type `Result<_, Box<(dyn StdError + 'static)>>`
+    |
+    = help: the trait `std::marker::Send` is not implemented for `dyn StdError`
+    = note: the question mark operation (`?`) implicitly performs a conversion on the error value using the `From` trait
+    = note: required for `std::ptr::Unique<dyn StdError>` to implement `std::marker::Send`
+note: required because it appears within the type `Box<dyn StdError>`
+   --> C:\Users\Misaka\.rustup\toolchains\stable-x86_64-pc-windows-msvc\lib/rustlib/src/rust\library\alloc\src\boxed.rs:234:12
+    |
+234 | pub struct Box<
+    |            ^^^
+    = note: required for `Box<dyn StdError + std::marker::Send + Sync>` to implement `From<Box<dyn StdError>>`
+
+error[E0277]: `?` couldn't convert the error: `dyn StdError: Sync` is not satisfied
+   --> src\main.rs:132:77
+    |
+ 88 | ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    |      ---------------------------------------------------- required `dyn StdError: Sync` because of this
+...
+132 |         let encoded_frames = encoder.encode(&captured.data, captured.stride)?;
+    |                                      ---------------------------------------^ `dyn StdError` cannot be shared between threads safely
+    |                                      |
+    |                                      this can't be annotated with `?` because it has type `Result<_, Box<(dyn StdError + 'static)>>`
+    |
+    = help: the trait `Sync` is not implemented for `dyn StdError`
+    = note: the question mark operation (`?`) implicitly performs a conversion on the error value using the `From` trait
+    = note: required for `std::ptr::Unique<dyn StdError>` to implement `Sync`
+note: required because it appears within the type `Box<dyn StdError>`
+   --> C:\Users\Misaka\.rustup\toolchains\stable-x86_64-pc-windows-msvc\lib/rustlib/src/rust\library\alloc\src\boxed.rs:234:12
+    |
+234 | pub struct Box<
+    |            ^^^
+    = note: required for `Box<dyn StdError + std::marker::Send + Sync>` to implement `From<Box<dyn StdError>>`
+
+error[E0277]: `?` couldn't convert the error: `dyn StdError: Sized` is not satisfied
+   --> src\main.rs:132:77
+    |
+ 88 | ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    |      ---------------------------------------------------- required `dyn StdError: Sized` because of this
+...
+132 |         let encoded_frames = encoder.encode(&captured.data, captured.stride)?;
+    |                                      ---------------------------------------^ doesn't have a size known at compile-time
+    |                                      |
+    |                                      this can't be annotated with `?` because it has type `Result<_, Box<(dyn StdError + 'static)>>`
+    |
+    = help: the trait `Sized` is not implemented for `dyn StdError`
+    = note: the question mark operation (`?`) implicitly performs a conversion on the error value using the `From` trait
+    = note: required for `Box<dyn StdError>` to implement `StdError`
+    = note: required for `Box<dyn StdError + std::marker::Send + Sync>` to implement `From<Box<dyn StdError>>`
+
+warning: variable does not need to be mutable
+  --> src\encode\av1_amf.rs:76:13
+   |
+76 |         let mut encoder_ctx = codec::context::Context::new_with_codec(codec);
+   |             ----^^^^^^^^^^^
+   |             |
+   |             help: remove this `mut`
+   |
+   = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: variable `last_keyframe_data` is assigned to, but never used
+  --> src\transport\websocket.rs:77:17
+   |
+77 |             let mut last_keyframe_data: Option<Arc<Vec<u8>>> = None;
+   |                 ^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: consider using `_last_keyframe_data` instead
+   = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: value assigned to `last_keyframe_data` is never read
+  --> src\transport\websocket.rs:86:33
+   |
+86 | ...                   last_keyframe_data = Some(frame_data.clone());
+   |                       ^^^^^^^^^^^^^^^^^^
+   |
+   = help: maybe it is overwritten before being read?
+   = note: `#[warn(unused_assignments)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `encode_time_us`
+   --> src\transport\websocket.rs:144:9
+    |
+144 |         encode_time_us: u64,
+    |         ^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_encode_time_us`
+
+Some errors have detailed explanations: E0061, E0277, E0382.
+For more information about an error, try `rustc --explain E0061`.
+warning: `webdisplay` (bin "webdisplay") generated 9 warnings
+error: could not compile `webdisplay` (bin "webdisplay") due to 14 previous errors; 9 warnings emitted

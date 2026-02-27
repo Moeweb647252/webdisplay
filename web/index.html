@@ -1,0 +1,131 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>超低延迟串流</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            background: #0a0a0a;
+            color: #e0e0e0;
+            font-family: 'Segoe UI', system-ui, sans-serif;
+            overflow: hidden;
+        }
+
+        #stream-canvas {
+            width: 100vw;
+            height: 100vh;
+            display: block;
+            cursor: none;
+        }
+
+        #overlay {
+            position: fixed;
+            top: 12px;
+            left: 12px;
+            background: rgba(0, 0, 0, 0.75);
+            padding: 10px 16px;
+            border-radius: 8px;
+            font-size: 13px;
+            font-family: 'Consolas', monospace;
+            z-index: 100;
+            backdrop-filter: blur(8px);
+            transition: opacity 0.3s;
+        }
+
+        #overlay.hidden {
+            opacity: 0;
+            pointer-events: none;
+        }
+
+        .stat-row {
+            display: flex;
+            justify-content: space-between;
+            gap: 24px;
+        }
+
+        .stat-label {
+            color: #888;
+        }
+
+        .stat-value {
+            color: #4fc3f7;
+            font-weight: bold;
+        }
+
+        .stat-value.warn {
+            color: #ffb74d;
+        }
+
+        .stat-value.bad {
+            color: #ef5350;
+        }
+
+        #connection-status {
+            position: fixed;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            font-size: 18px;
+            text-align: center;
+        }
+
+        .dot {
+            display: inline-block;
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            margin-right: 6px;
+        }
+
+        .dot.connected {
+            background: #4caf50;
+        }
+
+        .dot.disconnected {
+            background: #f44336;
+        }
+    </style>
+</head>
+
+<body>
+    <canvas id="stream-canvas"></canvas>
+
+    <div id="overlay">
+        <div class="stat-row">
+            <span class="stat-label">延迟</span>
+            <span class="stat-value" id="stat-latency">--</span>
+        </div>
+        <div class="stat-row">
+            <span class="stat-label">FPS</span>
+            <span class="stat-value" id="stat-fps">--</span>
+        </div>
+        <div class="stat-row">
+            <span class="stat-label">解码</span>
+            <span class="stat-value" id="stat-decode">--</span>
+        </div>
+        <div class="stat-row">
+            <span class="stat-label">帧队列</span>
+            <span class="stat-value" id="stat-queue">--</span>
+        </div>
+        <div class="stat-row">
+            <span class="stat-label">码率</span>
+            <span class="stat-value" id="stat-bitrate">--</span>
+        </div>
+    </div>
+
+    <div id="connection-status">
+        <span class="dot disconnected"></span> 正在连接...
+    </div>
+
+    <script src="player.js"></script>
+</body>
+
+</html>
