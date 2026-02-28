@@ -16,8 +16,11 @@ const TARGET_FPS: u32 = 60;
 /// 帧间隔
 /// $$\Delta t = \frac{1}{fps} = \frac{1}{60} \approx 16.67\text{ms}$$
 const FRAME_INTERVAL: Duration = Duration::from_micros(1_000_000 / TARGET_FPS as u64);
+/// DDA 捕获等待超时（毫秒）
+/// 需要向上取整，避免 60fps 时用 16ms 发生周期性超时。
+const CAPTURE_TIMEOUT_MS: u32 = (1_000u32 + TARGET_FPS - 1) / TARGET_FPS + 1;
 /// 目标码率 (bps)
-const TARGET_BITRATE: usize = 10_000_000;
+const TARGET_BITRATE: usize = 20_000_000;
 /// 关键帧间隔（秒）
 const KEYFRAME_INTERVAL_SECS: u32 = 2;
 /// 控制消息轮询超时
@@ -197,7 +200,10 @@ impl WebSocketServer {
                 log::info!("客户端请求关键帧");
             }
 
-            let captured = match capturer.capture_frame(16).map_err(|e| e.to_string())? {
+            let captured = match capturer
+                .capture_frame(CAPTURE_TIMEOUT_MS)
+                .map_err(|e| e.to_string())?
+            {
                 Some(frame) => frame,
                 None => {
                     Self::pace_frame(frame_start);

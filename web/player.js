@@ -8,6 +8,8 @@
  */
 
 const HEADER_SIZE = 16;
+const SERVER_FPS = 60;
+const FRAME_TIMESTAMP_US = Math.round(1_000_000 / SERVER_FPS);
 
 // 帧类型
 const FRAME_TYPE = {
@@ -713,8 +715,9 @@ class UltraLowLatencyPlayer {
         const frameType = view.getUint8(0);
         const flags = view.getUint8(1);
         const sequence = view.getUint32(2, true);
-        const pts = view.getUint32(6, true);
         const payloadLen = view.getUint32(10, true);
+
+        if (HEADER_SIZE + payloadLen > data.byteLength) return;
 
         const payload = new Uint8Array(data, HEADER_SIZE, payloadLen);
 
@@ -740,19 +743,19 @@ class UltraLowLatencyPlayer {
         const decodeStart = performance.now();
 
         try {
-            const chunk = new EncodedVideoChunk({
-                type: isKeyframe ? 'key' : 'delta',
-                timestamp: pts * 1000, // 转为微秒
-                data: payload,
-            });
-
-            // 如果解码器队列过长，重置并请求关键帧
-            if (this.decoder.decodeQueueSize > 3) {
-                console.warn('解码队列过长, 重置');
+            const queueSize = this.decoder.decodeQueueSize;
+            if (queueSize > 10) {
+                console.warn(`解码队列过长(${queueSize}), 重置`);
                 this._resetDecoder();
                 this._requestKeyframe();
                 return;
             }
+
+            const chunk = new EncodedVideoChunk({
+                type: isKeyframe ? 'key' : 'delta',
+                timestamp: sequence * FRAME_TIMESTAMP_US,
+                data: payload,
+            });
 
             // 守卫：只在解码器处于可用状态时才送入帧
             if (this.decoder.state !== 'configured') {

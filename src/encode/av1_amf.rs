@@ -64,9 +64,10 @@ impl Av1AmfEncoder {
     /// 关键低延迟配置：
     /// 1. `usage=ultralowlatency` — AMF 超低延迟预设
     /// 2. `quality=speed` — 最大化编码速度
-    /// 3. `rc=cbr` — 恒定码率，避免码率波动引起的延迟抖动
-    /// 4. `header_insertion_mode=gop` — 每个 GOP 头插入，支持随时加入
-    /// 5. 禁用 B 帧 — B 帧引入额外 $T_{reorder} = \frac{N_B}{fps}$ 延迟
+    /// 3. `latency=lowest_latency` + `async_depth=1` — 限制编码队列深度
+    /// 4. `rc=cbr` + `skip_frame=0` — 避免码控主动跳帧
+    /// 5. `header_insertion_mode=gop` — 每个 GOP 头插入，支持随时加入
+    /// 6. 禁用 B 帧 — B 帧引入额外 $T_{reorder} = \frac{N_B}{fps}$ 延迟
     pub fn new(config: &EncoderConfig) -> Result<Self, Box<dyn std::error::Error>> {
         ffmpeg::init()?;
 
@@ -86,12 +87,19 @@ impl Av1AmfEncoder {
         video.set_bit_rate(config.bitrate);
         video.set_max_bit_rate(config.bitrate);
         video.set_gop(config.fps * config.keyframe_interval);
+        video.set_max_b_frames(0);
 
         // AMF 专用低延迟参数
         let mut opts = Dictionary::new();
         opts.set("usage", "ultralowlatency"); // 超低延迟模式
         opts.set("quality", "speed"); // 速度优先
-        opts.set("rc", "vbr_latency"); // 恒定码率
+        opts.set("latency", "lowest_latency");
+        opts.set("rc", "vbr_latency"); // 码率控制模式，适合低延迟
+        opts.set("async_depth", "1");
+        opts.set("skip_frame", "0");
+        opts.set("preanalysis", "0");
+        opts.set("preencode", "0");
+        opts.set("bf", "0");
         opts.set("header_insertion_mode", "gop"); // GOP 级别头插入
         opts.set("log_to_dbg", "0");
 
