@@ -5,21 +5,11 @@ mod server;
 mod transport;
 
 use capture::dda::DdaCapture;
-use encode::av1_amf::{Av1AmfEncoder, EncoderConfig};
 use server::http::run_server;
 use transport::websocket::WebSocketServer;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::time::{Duration, Instant};
-use tokio::sync::mpsc;
-
-/// 目标帧率
-const TARGET_FPS: u32 = 60;
-/// 帧间隔
-/// $$\Delta t = \frac{1}{fps} = \frac{1}{60} \approx 16.67\text{ms}$$
-const FRAME_INTERVAL: Duration = Duration::from_micros(1_000_000 / TARGET_FPS as u64);
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -27,14 +17,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
     log::info!("=== 超低延迟串流服务器启动 ===");
-
-    // 关键帧请求通道
-    let (keyframe_tx, mut keyframe_rx) = mpsc::channel::<()>(8);
-    let force_keyframe = Arc::new(AtomicBool::new(false));
-    let force_kf_clone = force_keyframe.clone();
-
-    // 显示器切换通道
-    let (monitor_switch_tx, monitor_switch_rx) = mpsc::channel::<u32>(8);
 
     // 获取并序列化初始显示器列表
     let monitors = DdaCapture::enumerate_monitors().unwrap_or_default();
@@ -51,16 +33,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let monitor_list_json = Arc::new(serde_json::to_vec(&monitors).unwrap_or_default());
 
     // 初始化 WebSocket 服务器
-    let (ws_server, _frame_tx) =
-        WebSocketServer::new(keyframe_tx, monitor_switch_tx, monitor_list_json);
-    let ws_server = Arc::new(ws_server);
-
-    // 启动关键帧请求监听
-    tokio::spawn(async move {
-        while keyframe_rx.recv().await.is_some() {
-            force_kf_clone.store(true, Ordering::Relaxed);
-        }
-    });
+    let ws_server = Arc::new(WebSocketServer::new(monitor_list_json));
 
     // 初始化 TLS
     let tls_config = server::tls::get_tls_config()?;
@@ -68,159 +41,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 启动统一 HTTP + WebSocket 服务器
     let server_addr: SocketAddr = "0.0.0.0:8080".parse()?;
-    let ws_server_http = ws_server.clone();
-    tokio::spawn(async move {
-        if let Err(e) = run_server(server_addr, tls_acceptor, ws_server_http).await {
-            log::error!("HTTP/WebSocket 服务器错误: {}", e);
-        }
-    });
-
-    // ===== 捕获-编码主循环 =====
-    // 在独立线程中运行（避免阻塞 tokio 运行时）
-    let ws_server_encode = ws_server.clone();
-    let encode_handle = std::thread::Builder::new()
-        .name("capture-encode".into())
-        .spawn(move || {
-            if let Err(e) = capture_encode_loop(ws_server_encode, force_keyframe, monitor_switch_rx)
-            {
-                log::error!("Capture/Encode thread error: {}", e);
-            }
-        })?;
 
     log::info!("服务已启动！");
     log::info!("  Web 界面: https://localhost:8080");
     log::info!("  WebSocket: wss://localhost:8080/ws");
 
-    encode_handle.join().unwrap();
+    run_server(server_addr, tls_acceptor, ws_server)
+        .await
+        .map_err(|e| -> Box<dyn std::error::Error> { e })?;
     Ok(())
-}
-
-/// 捕获-编码主循环
-///
-/// 采用忙等待 + 自旋的方式精确控制帧间隔：
-/// $$t_{sleep} = \max(0, \Delta t - T_{capture} - T_{encode} - T_{margin})$$
-///
-/// 其中 $T_{margin} \approx 0.5\text{ms}$ 为自旋等待的余量。
-fn capture_encode_loop(
-    ws_server: Arc<WebSocketServer>,
-    force_keyframe: Arc<AtomicBool>,
-    mut monitor_switch_rx: mpsc::Receiver<u32>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    // 初始显示器索引
-    let mut current_monitor_index = 0;
-
-    // 初始化捕获器
-    let mut capturer = DdaCapture::new(current_monitor_index)?;
-    let mut width = capturer.width();
-    let mut height = capturer.height();
-
-    // 初始化编码器
-    let mut config = EncoderConfig {
-        width,
-        height,
-        fps: TARGET_FPS,
-        bitrate: 10_000_000, // 10 Mbps
-        keyframe_interval: 2,
-    };
-    let mut encoder = Av1AmfEncoder::new(&config)?;
-
-    let frame_seq = AtomicU32::new(0);
-    let mut stats_interval = Instant::now();
-    let mut frames_encoded: u64 = 0;
-    let mut total_encode_time_us: u64 = 0;
-
-    log::info!("捕获-编码循环启动: {}x{} @{}fps", width, height, TARGET_FPS);
-
-    loop {
-        // 处理显示器切换请求
-        if let Ok(new_index) = monitor_switch_rx.try_recv() {
-            if new_index != current_monitor_index {
-                log::info!("正在切换显示器到索引 {}", new_index);
-                match DdaCapture::new(new_index) {
-                    Ok(new_capturer) => {
-                        capturer = new_capturer;
-                        current_monitor_index = new_index;
-                        width = capturer.width();
-                        height = capturer.height();
-
-                        config.width = width;
-                        config.height = height;
-
-                        match Av1AmfEncoder::new(&config) {
-                            Ok(new_encoder) => {
-                                encoder = new_encoder;
-                                force_keyframe.store(true, Ordering::Relaxed);
-                                log::info!("显示器切换成功：{}x{}", width, height);
-                            }
-                            Err(e) => log::error!("切换显示器后初始化编码器失败: {}", e),
-                        }
-                    }
-                    Err(e) => log::error!("切换显示器失败: {}", e),
-                }
-            }
-        }
-
-        let frame_start = Instant::now();
-
-        // Check if we need to force a keyframe
-        let requesting_kf = force_keyframe.swap(false, Ordering::Relaxed);
-        if requesting_kf {
-            log::info!("强制请求关键帧");
-        }
-
-        // 1. 捕获
-        let captured = match capturer.capture_frame(16)? {
-            Some(f) => f,
-            None => continue, // 无新帧，继续轮询
-        };
-
-        // 2. 编码
-        let encoded_frames = encoder.encode(&captured.data, captured.stride, requesting_kf)?;
-
-        // 3. 传输
-        for ef in &encoded_frames {
-            let seq = frame_seq.fetch_add(1, Ordering::Relaxed);
-            ws_server.broadcast_frame(
-                &ef.data,
-                seq,
-                ef.pts as u32,
-                ef.is_keyframe,
-                ef.encode_time_us,
-            );
-
-            frames_encoded += 1;
-            total_encode_time_us += ef.encode_time_us;
-        }
-
-        // 4. 统计输出（每 5 秒一次）
-        if stats_interval.elapsed() >= Duration::from_secs(5) {
-            let avg_encode_ms = if frames_encoded > 0 {
-                (total_encode_time_us as f64 / frames_encoded as f64) / 1000.0
-            } else {
-                0.0
-            };
-            log::info!(
-                "统计: 已编码 {} 帧, 平均编码耗时: {:.2}ms",
-                frames_encoded,
-                avg_encode_ms,
-            );
-            stats_interval = Instant::now();
-            frames_encoded = 0;
-            total_encode_time_us = 0;
-        }
-
-        // 5. 精确帧间隔控制
-        let elapsed = frame_start.elapsed();
-        if elapsed < FRAME_INTERVAL {
-            let sleep_duration = FRAME_INTERVAL - elapsed;
-            // 先 sleep 大部分时间，然后自旋等待精确时间点
-            if sleep_duration > Duration::from_micros(500) {
-                std::thread::sleep(sleep_duration - Duration::from_micros(500));
-            }
-            // 自旋等待剩余时间（精度 < 1μs）
-            while frame_start.elapsed() < FRAME_INTERVAL {
-                std::hint::spin_loop();
-            }
-        }
-    }
 }
