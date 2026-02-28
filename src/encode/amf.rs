@@ -142,6 +142,7 @@ impl AmfEncoder {
                 opts.set("usage", "ultralowlatency");
                 opts.set("vbaq", "false");
                 opts.set("bf", "0");
+                opts.set("forced_idr", "true");
             }
             VideoCodec::Hevc => {
                 opts.set("usage", "ultralowlatency");
