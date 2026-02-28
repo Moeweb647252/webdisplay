@@ -374,6 +374,16 @@ impl DdaCapture {
 
             let video_processor = video_device.CreateVideoProcessor(&video_processor_enum, 0)?;
 
+            let color_space = D3D11_VIDEO_PROCESSOR_COLOR_SPACE {
+                _bitfield: (0 & 1)
+                    | ((0 & 1) << 1)
+                    | ((1 & 1) << 2)
+                    | ((0 & 1) << 3)
+                    | ((2 & 3) << 4),
+            };
+            video_context.VideoProcessorSetStreamColorSpace(&video_processor, 0, &color_space);
+            video_context.VideoProcessorSetOutputColorSpace(&video_processor, &color_space);
+
             // 输出视图（NV12 纹理）
             let output_view_desc = D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC {
                 ViewDimension: D3D11_VPOV_DIMENSION_TEXTURE2D,
@@ -609,8 +619,13 @@ impl DdaCapture {
             //   UV rows: pData + RowPitch*Height + row * RowPitch
             // Mapping subresource 1 separately returns E_INVALIDARG on most drivers.
             let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
-            self.context
-                .Map(&self.staging_texture, 0, D3D11_MAP_READ, 0, Some(&mut mapped))?;
+            self.context.Map(
+                &self.staging_texture,
+                0,
+                D3D11_MAP_READ,
+                0,
+                Some(&mut mapped),
+            )?;
 
             let w = self.width as usize;
             let h = self.height as usize;

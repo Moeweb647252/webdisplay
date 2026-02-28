@@ -143,6 +143,7 @@ impl AmfEncoder {
                 opts.set("vbaq", "false");
                 opts.set("bf", "0");
                 opts.set("forced_idr", "true");
+                opts.set("header_spacing", "1");
             }
             VideoCodec::Hevc => {
                 opts.set("usage", "ultralowlatency");
