@@ -1,15 +1,17 @@
 import { reactive } from 'vue'
 
 const HEADER_SIZE = 16
-const SERVER_FPS = 60
-const FRAME_TIMESTAMP_US = Math.round(1_000_000 / SERVER_FPS)
 const BASE_CONTROL_HINT = 'Moonlight 快捷键: Ctrl+Alt+Shift+Z 接管/释放 · S 统计 · X 全屏 · M 显示器 · E 编码 · Q 断开/重连'
+const RECONNECT_DELAY_MS = 3000
+const WEBTRANSPORT_PATH = '/webtransport'
+const WEBTRANSPORT_HASH_PATH = '/webtransport/hash'
+const MAX_WEBTRANSPORT_PACKET_SIZE = 64 * 1024 * 1024
 
 const CODEC_PRESETS = Object.freeze([
   {
-    id: 'av1',
-    label: 'AV1',
-    decoderCandidates: ['av01.0.08M.08'],
+    id: 'avc',
+    label: 'AVC',
+    decoderCandidates: ['avc1.640028', 'avc1.4D401F', 'avc1.42E01E'],
   },
   {
     id: 'hevc',
@@ -17,9 +19,9 @@ const CODEC_PRESETS = Object.freeze([
     decoderCandidates: ['hvc1.1.6.L93.B0', 'hev1.1.6.L93.B0'],
   },
   {
-    id: 'avc',
-    label: 'AVC',
-    decoderCandidates: ['avc1.640028', 'avc1.4D401F', 'avc1.42E01E'],
+    id: 'av1',
+    label: 'AV1',
+    decoderCandidates: ['av01.0.08M.08'],
   },
 ])
 
@@ -29,11 +31,13 @@ const CODEC_ID_ALIASES = Object.freeze({
 })
 
 const ENCODING_DEFAULTS = Object.freeze({
-  codec: 'av1',
+  codec: 'avc',
   fps: 60,
   bitrateMbps: 20,
   keyframeInterval: 2,
 })
+
+const HIGH_FPS_HINT_THRESHOLD = 72
 
 const ENCODING_LIMITS = Object.freeze({
   fps: { min: 24, max: 120 },
@@ -85,7 +89,8 @@ export const createUiState = () =>
 
 export class UltraLowLatencyPlayer {
   constructor(canvas, uiState) {
-    const context = canvas.getContext('2d')
+    const context =
+      canvas.getContext('2d', { alpha: false, desynchronized: true }) || canvas.getContext('2d')
     if (!context) {
       throw new Error('无法获取 2D 渲染上下文')
     }
@@ -96,6 +101,12 @@ export class UltraLowLatencyPlayer {
 
     this.decoder = null
     this.ws = null
+    this.webTransport = null
+    this.webTransportWriter = null
+    this.webTransportReader = null
+    this.webTransportReadBuffer = new Uint8Array(0)
+    this.transportKind = null
+    this.transportCloseHandled = false
     this.connected = false
     this.autoReconnect = true
     this.reconnectTimer = null
@@ -136,6 +147,7 @@ export class UltraLowLatencyPlayer {
 
     this.pendingFrame = null
     this.renderBound = this._renderLoop.bind(this)
+    this.lastChunkTimestampUs = 0
 
     const scopedWindow = window
     const previousPlayer = scopedWindow[PLAYER_GLOBAL_KEY]
@@ -170,10 +182,8 @@ export class UltraLowLatencyPlayer {
       this.statsTimer = null
     }
 
-    if (this.ws && (this.ws.readyState === WebSocket.OPEN || this.ws.readyState === WebSocket.CONNECTING)) {
-      this.ws.close(1000, 'player destroy')
-    }
-    this.ws = null
+    this._closeTransport('player destroy')
+    this._resetTransportState()
 
     if (this.pendingFrame) {
       this.pendingFrame.close()
@@ -202,6 +212,103 @@ export class UltraLowLatencyPlayer {
     this.ui.connected = connected
     this.ui.connectionText = text
     this.ui.connectionDetail = detail
+  }
+
+  _resetTransportState() {
+    this.ws = null
+    this.webTransport = null
+    this.webTransportWriter = null
+    this.webTransportReader = null
+    this.webTransportReadBuffer = new Uint8Array(0)
+    this.transportKind = null
+  }
+
+  _isTransportOpen() {
+    if (this.transportKind === 'websocket') {
+      return this.ws && this.ws.readyState === WebSocket.OPEN
+    }
+
+    if (this.transportKind === 'webtransport') {
+      return !!(this.webTransport && this.webTransportWriter && this.webTransportReader)
+    }
+
+    return false
+  }
+
+  _isTransportActive() {
+    if (this.ws && (this.ws.readyState === WebSocket.OPEN || this.ws.readyState === WebSocket.CONNECTING)) {
+      return true
+    }
+
+    return !!this.webTransport
+  }
+
+  _closeTransport(reason = 'client close') {
+    if (this.ws && (this.ws.readyState === WebSocket.OPEN || this.ws.readyState === WebSocket.CONNECTING)) {
+      this.ws.close(1000, reason)
+    }
+
+    if (this.webTransportReader) {
+      this.webTransportReader.cancel(reason).catch(() => {})
+      try {
+        this.webTransportReader.releaseLock()
+      } catch (_) {
+      }
+    }
+
+    if (this.webTransportWriter) {
+      this.webTransportWriter.close().catch(() => {})
+      try {
+        this.webTransportWriter.releaseLock()
+      } catch (_) {
+      }
+    }
+
+    if (this.webTransport) {
+      try {
+        this.webTransport.close({ closeCode: 0, reason })
+      } catch (_) {
+        try {
+          this.webTransport.close()
+        } catch (_) {
+        }
+      }
+    }
+  }
+
+  _onTransportDisconnected(reasonText = '连接已断开') {
+    if (this.transportCloseHandled) {
+      return
+    }
+
+    this.transportCloseHandled = true
+    this._resetTransportState()
+    this.connected = false
+    this._releaseAllInputs()
+    this.controlActive = false
+    this._exitPointerLock()
+    this._applyCursorVisibility()
+
+    if (this.autoReconnect) {
+      this._setConnectionState({
+        visible: true,
+        connected: false,
+        text: `${reasonText}，3秒后重连...`,
+        detail: '',
+      })
+      this.reconnectTimer = setTimeout(() => {
+        this.reconnectTimer = null
+        this.transportCloseHandled = false
+        void this._connect()
+      }, RECONNECT_DELAY_MS)
+    } else {
+      this._setConnectionState({
+        visible: true,
+        connected: false,
+        text: '会话已退出，按 Ctrl+Alt+Shift+Q 重连',
+        detail: '',
+      })
+    }
   }
 
   async _init() {
@@ -236,7 +343,7 @@ export class UltraLowLatencyPlayer {
       label: item.label,
     }))
 
-    const initialCodec = supportedCodecs[0].id
+    const initialCodec = this._pickInitialCodec(supportedCodecs)
     this.encodingSettings = {
       ...ENCODING_DEFAULTS,
       codec: initialCodec,
@@ -244,7 +351,7 @@ export class UltraLowLatencyPlayer {
     this.ui.encodingDraft = { ...this.encodingSettings }
 
     this._initDecoder(initialCodec)
-    this._connect()
+    void this._connect()
     requestAnimationFrame(this.renderBound)
     this._startStatsUpdate()
     this._bindInputEvents()
@@ -298,6 +405,17 @@ export class UltraLowLatencyPlayer {
     return preset ? preset.label : codecId
   }
 
+  _pickInitialCodec(supportedCodecs) {
+    const speedPriority = ['avc', 'hevc', 'av1']
+    for (const codecId of speedPriority) {
+      if (supportedCodecs.some((item) => item.id === codecId)) {
+        return codecId
+      }
+    }
+
+    return supportedCodecs[0].id
+  }
+
   _resolveDecoderCodec(codecId) {
     const config = this.supportedCodecConfigs.get(codecId)
     return config ? config.decoderCodec : null
@@ -323,6 +441,7 @@ export class UltraLowLatencyPlayer {
           this.stats.framesDropped++
         }
         this.stats.framesDecoded++
+        this.stats.fpsCount++
       },
       error: (error) => {
         console.error('解码错误:', error)
@@ -356,20 +475,17 @@ export class UltraLowLatencyPlayer {
     this._initDecoder(codecId)
   }
 
-  _connect() {
+  async _connect() {
     if (this.reconnectTimer) {
       clearTimeout(this.reconnectTimer)
       this.reconnectTimer = null
     }
 
-    if (this.ws && (this.ws.readyState === WebSocket.OPEN || this.ws.readyState === WebSocket.CONNECTING)) {
+    if (this._isTransportActive()) {
       return
     }
 
-    const wsProtocol = location.protocol === 'https:' ? 'wss' : 'ws'
-    const wsUrl = `${wsProtocol}://${location.host}/ws`
-    console.log('连接到:', wsUrl)
-
+    this.transportCloseHandled = false
     this._setConnectionState({
       visible: true,
       connected: false,
@@ -377,10 +493,174 @@ export class UltraLowLatencyPlayer {
       detail: '',
     })
 
+    const canUseWebTransport = typeof WebTransport !== 'undefined' && location.protocol === 'https:'
+    if (canUseWebTransport) {
+      const webTransportConnected = await this._connectWebTransport()
+      if (webTransportConnected) {
+        return
+      }
+
+      this._setConnectionState({
+        visible: true,
+        connected: false,
+        text: 'WebTransport 不可用，回退 WebSocket...',
+        detail: '',
+      })
+    }
+
+    this._connectWebSocket()
+  }
+
+  async _connectWebTransport() {
+    const wtUrl = `https://${location.host}${WEBTRANSPORT_PATH}`
+    console.log('尝试 WebTransport 连接:', wtUrl)
+
+    const withTimeout = (promise, timeoutMs, timeoutMsg) =>
+      Promise.race([
+        promise,
+        new Promise((_, reject) => {
+          setTimeout(() => reject(new Error(timeoutMsg)), timeoutMs)
+        }),
+      ])
+
+    let transport = null
+    try {
+      const certHash = await this._fetchWebTransportServerCertificateHash()
+      const transportOptions = {
+        allowPooling: false,
+      }
+
+      if (certHash) {
+        transportOptions.serverCertificateHashes = [certHash]
+      }
+
+      transport = new WebTransport(wtUrl, transportOptions)
+      this.webTransport = transport
+      this.transportKind = 'webtransport'
+
+      await withTimeout(transport.ready, 1500, 'WebTransport 握手超时')
+      const bidiStream = await withTimeout(
+        transport.createBidirectionalStream(),
+        1500,
+        'WebTransport 双向流建立超时',
+      )
+      this.webTransportWriter = bidiStream.writable.getWriter()
+      this.webTransportReader = bidiStream.readable.getReader()
+      this.webTransportReadBuffer = new Uint8Array(0)
+
+      transport.closed
+        .then(() => {
+          if (this.transportKind === 'webtransport') {
+            console.log('WebTransport 已断开')
+            this._onTransportDisconnected('WebTransport 连接断开')
+          }
+        })
+        .catch((error) => {
+          if (this.transportKind === 'webtransport') {
+            console.warn('WebTransport closed:', error)
+            this._onTransportDisconnected('WebTransport 连接断开')
+          }
+        })
+
+      console.log('WebTransport 已连接')
+      this.connected = true
+      this.autoReconnect = true
+      this._setConnectionState({
+        visible: false,
+        connected: true,
+        text: '已连接',
+        detail: '传输: WebTransport',
+      })
+      this._syncEncodingSettings(false)
+      this._requestKeyframe()
+      void this._webTransportReadLoop()
+      return true
+    } catch (error) {
+      console.warn('WebTransport 连接失败:', error)
+
+      if (this.webTransportReader) {
+        this.webTransportReader.cancel('fallback to websocket').catch(() => {})
+        try {
+          this.webTransportReader.releaseLock()
+        } catch (_) {
+        }
+      }
+      if (this.webTransportWriter) {
+        this.webTransportWriter.close().catch(() => {})
+        try {
+          this.webTransportWriter.releaseLock()
+        } catch (_) {
+        }
+      }
+      if (transport) {
+        try {
+          transport.close()
+        } catch (_) {
+        }
+      }
+
+      this._resetTransportState()
+      return false
+    }
+  }
+
+  async _fetchWebTransportServerCertificateHash(timeoutMs = 1200) {
+    const endpoint = `${location.origin}${WEBTRANSPORT_HASH_PATH}`
+    const controller = new AbortController()
+    const timer = setTimeout(() => {
+      controller.abort()
+    }, timeoutMs)
+
+    try {
+      const response = await fetch(endpoint, {
+        method: 'GET',
+        cache: 'no-store',
+        signal: controller.signal,
+      })
+      if (!response.ok) {
+        return null
+      }
+
+      const payload = await response.json()
+      const bytes = payload && Array.isArray(payload.value) ? payload.value : null
+      if (!bytes || bytes.length !== 32) {
+        return null
+      }
+
+      const normalizedBytes = []
+      for (const raw of bytes) {
+        const value = Number.parseInt(raw, 10)
+        if (!Number.isFinite(value) || value < 0 || value > 255) {
+          return null
+        }
+        normalizedBytes.push(value)
+      }
+
+      return {
+        algorithm: typeof payload.algorithm === 'string' ? payload.algorithm.toLowerCase() : 'sha-256',
+        value: new Uint8Array(normalizedBytes),
+      }
+    } catch (_) {
+      return null
+    } finally {
+      clearTimeout(timer)
+    }
+  }
+
+  _connectWebSocket() {
+    const wsProtocol = location.protocol === 'https:' ? 'wss' : 'ws'
+    const wsUrl = `${wsProtocol}://${location.host}/ws`
+    console.log('连接到:', wsUrl)
+
+    this.transportKind = 'websocket'
     this.ws = new WebSocket(wsUrl)
     this.ws.binaryType = 'arraybuffer'
 
     this.ws.onopen = () => {
+      if (this.transportKind !== 'websocket') {
+        return
+      }
+
       console.log('WebSocket 已连接')
       this.connected = true
       this.autoReconnect = true
@@ -388,7 +668,7 @@ export class UltraLowLatencyPlayer {
         visible: false,
         connected: true,
         text: '已连接',
-        detail: '',
+        detail: '传输: WebSocket',
       })
       this._syncEncodingSettings(false)
       this._requestKeyframe()
@@ -403,36 +683,74 @@ export class UltraLowLatencyPlayer {
     }
 
     this.ws.onclose = () => {
-      console.log('WebSocket 已断开')
-      this.connected = false
-      this._releaseAllInputs()
-      this.controlActive = false
-      this._exitPointerLock()
-      this._applyCursorVisibility()
-
-      if (this.autoReconnect) {
-        this._setConnectionState({
-          visible: true,
-          connected: false,
-          text: '连接断开，3秒后重连...',
-          detail: '',
-        })
-        this.reconnectTimer = setTimeout(() => {
-          this.reconnectTimer = null
-          this._connect()
-        }, 3000)
-      } else {
-        this._setConnectionState({
-          visible: true,
-          connected: false,
-          text: '会话已退出，按 Ctrl+Alt+Shift+Q 重连',
-          detail: '',
-        })
+      if (this.transportKind === 'websocket') {
+        console.log('WebSocket 已断开')
+        this._onTransportDisconnected('WebSocket 连接断开')
       }
     }
 
     this.ws.onerror = (error) => {
       console.error('WebSocket 错误:', error)
+    }
+  }
+
+  async _webTransportReadLoop() {
+    if (!this.webTransportReader) {
+      return
+    }
+
+    try {
+      while (this.transportKind === 'webtransport' && this.webTransportReader) {
+        const { value, done } = await this.webTransportReader.read()
+        if (done) {
+          break
+        }
+
+        if (!value || value.byteLength === 0) {
+          continue
+        }
+
+        this._consumeWebTransportChunk(value)
+      }
+    } catch (error) {
+      if (this.transportKind === 'webtransport') {
+        console.warn('WebTransport 读取失败:', error)
+      }
+    }
+
+    if (this.transportKind === 'webtransport') {
+      this._onTransportDisconnected('WebTransport 连接断开')
+    }
+  }
+
+  _consumeWebTransportChunk(chunk) {
+    const incoming = chunk instanceof Uint8Array ? chunk : new Uint8Array(chunk)
+    const merged = new Uint8Array(this.webTransportReadBuffer.byteLength + incoming.byteLength)
+    merged.set(this.webTransportReadBuffer, 0)
+    merged.set(incoming, this.webTransportReadBuffer.byteLength)
+    this.webTransportReadBuffer = merged
+
+    while (this.webTransportReadBuffer.byteLength >= 4) {
+      const frameLen = new DataView(
+        this.webTransportReadBuffer.buffer,
+        this.webTransportReadBuffer.byteOffset,
+        4,
+      ).getUint32(0, true)
+
+      if (frameLen > MAX_WEBTRANSPORT_PACKET_SIZE) {
+        throw new Error(`WebTransport 包长度异常: ${frameLen}`)
+      }
+
+      const packetLen = 4 + frameLen
+      if (this.webTransportReadBuffer.byteLength < packetLen) {
+        return
+      }
+
+      const packet = this.webTransportReadBuffer.slice(4, packetLen)
+      const packetBuffer = packet.buffer.slice(packet.byteOffset, packet.byteOffset + packet.byteLength)
+      this._handleMessage(packetBuffer)
+
+      this.webTransportReadBuffer = this.webTransportReadBuffer.slice(packetLen)
     }
   }
 
@@ -497,7 +815,7 @@ export class UltraLowLatencyPlayer {
   }
 
   _syncEncodingSettings(requestKeyframe = true) {
-    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+    if (!this._isTransportOpen()) {
       return false
     }
 
@@ -517,6 +835,7 @@ export class UltraLowLatencyPlayer {
 
   _applyEncodingSettings() {
     const normalized = this._normalizeEncodingDraft(this.ui.encodingDraft, this.encodingSettings)
+    const highFpsAv1 = normalized.codec === 'av1' && normalized.fps >= HIGH_FPS_HINT_THRESHOLD
     const codecChanged = normalized.codec !== this.encodingSettings.codec
 
     this.encodingSettings = { ...normalized }
@@ -532,6 +851,11 @@ export class UltraLowLatencyPlayer {
       this._flashHint(
         `编码设置已应用: ${codecLabel} / ${this.encodingSettings.fps}fps / ${this.encodingSettings.bitrateMbps}Mbps`,
       )
+      if (highFpsAv1) {
+        setTimeout(() => {
+          this._flashHint('当前 AV1 高帧率可能受限，建议切换 AVC/HEVC 以提升 FPS')
+        }, 900)
+      }
     } else {
       this._flashHint('编码设置已保存，将在重连后自动应用')
     }
@@ -874,10 +1198,18 @@ export class UltraLowLatencyPlayer {
   }
 
   _toggleStreamSession() {
-    if (this.ws && (this.ws.readyState === WebSocket.OPEN || this.ws.readyState === WebSocket.CONNECTING)) {
+    if (this._isTransportActive()) {
       this.autoReconnect = false
       this._deactivateControl()
-      this.ws.close(1000, 'client quit')
+      this._closeTransport('client quit')
+      this._resetTransportState()
+      this.connected = false
+      this._setConnectionState({
+        visible: true,
+        connected: false,
+        text: '会话已退出，按 Ctrl+Alt+Shift+Q 重连',
+        detail: '',
+      })
       this._flashHint('会话已退出')
       return
     }
@@ -889,7 +1221,8 @@ export class UltraLowLatencyPlayer {
       text: '正在连接...',
       detail: '',
     })
-    this._connect()
+    this.transportCloseHandled = false
+    void this._connect()
     this._flashHint('正在重新连接')
   }
 
@@ -985,7 +1318,7 @@ export class UltraLowLatencyPlayer {
   }
 
   _releaseAllInputs() {
-    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+    if (this._isTransportOpen()) {
       for (const keyInfo of this.pressedKeys.values()) {
         this._sendJsonControlPacket(FRAME_TYPE.KEYBOARD_INPUT, {
           key_code: keyInfo.keyCode,
@@ -1098,8 +1431,46 @@ export class UltraLowLatencyPlayer {
     })
   }
 
+  _sendBinaryPacket(buffer) {
+    if (!this._isTransportOpen()) {
+      return false
+    }
+
+    if (this.transportKind === 'websocket' && this.ws) {
+      this.ws.send(buffer)
+      return true
+    }
+
+    if (this.transportKind === 'webtransport' && this.webTransportWriter) {
+      let payload = null
+      if (buffer instanceof ArrayBuffer) {
+        payload = new Uint8Array(buffer)
+      } else if (ArrayBuffer.isView(buffer)) {
+        payload = new Uint8Array(buffer.buffer, buffer.byteOffset, buffer.byteLength)
+      }
+
+      if (!payload) {
+        return false
+      }
+
+      const framed = new Uint8Array(4 + payload.byteLength)
+      new DataView(framed.buffer).setUint32(0, payload.byteLength, true)
+      framed.set(payload, 4)
+
+      this.webTransportWriter.write(framed).catch((error) => {
+        console.warn('WebTransport 写入失败:', error)
+        if (this.transportKind === 'webtransport') {
+          this._onTransportDisconnected('WebTransport 写入失败')
+        }
+      })
+      return true
+    }
+
+    return false
+  }
+
   _sendJsonControlPacket(frameType, payloadObj) {
-    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+    if (!this._isTransportOpen()) {
       return
     }
 
@@ -1112,7 +1483,7 @@ export class UltraLowLatencyPlayer {
     const packet = new Uint8Array(HEADER_SIZE + payload.byteLength)
     packet.set(new Uint8Array(header), 0)
     packet.set(payload, HEADER_SIZE)
-    this.ws.send(packet.buffer)
+    this._sendBinaryPacket(packet.buffer)
   }
 
   _handleMessage(data) {
@@ -1178,7 +1549,7 @@ export class UltraLowLatencyPlayer {
 
       const chunk = new EncodedVideoChunk({
         type: isKeyframe ? 'key' : 'delta',
-        timestamp: sequence * FRAME_TIMESTAMP_US,
+        timestamp: this._nextChunkTimestampUs(sequence),
         data: payload,
       })
 
@@ -1203,7 +1574,6 @@ export class UltraLowLatencyPlayer {
 
       this.ctx.drawImage(frame, 0, 0)
       frame.close()
-      this.stats.fpsCount++
     }
 
     requestAnimationFrame(this.renderBound)
@@ -1222,15 +1592,33 @@ export class UltraLowLatencyPlayer {
     this._initDecoder(codecId)
   }
 
+  _nextChunkTimestampUs(sequence) {
+    const fps = this._clampInt(
+      this.encodingSettings.fps,
+      ENCODING_LIMITS.fps.min,
+      ENCODING_LIMITS.fps.max,
+      ENCODING_DEFAULTS.fps,
+    )
+    const frameDurationUs = Math.max(1, Math.round(1_000_000 / fps))
+    const candidateTimestampUs = sequence * frameDurationUs
+    const nextTimestampUs =
+      candidateTimestampUs > this.lastChunkTimestampUs
+        ? candidateTimestampUs
+        : this.lastChunkTimestampUs + frameDurationUs
+
+    this.lastChunkTimestampUs = nextTimestampUs
+    return nextTimestampUs
+  }
+
   _requestKeyframe() {
-    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+    if (!this._isTransportOpen()) {
       return
     }
 
     const header = new ArrayBuffer(HEADER_SIZE)
     const view = new DataView(header)
     view.setUint8(0, FRAME_TYPE.KEYFRAME_REQUEST)
-    this.ws.send(header)
+    this._sendBinaryPacket(header)
   }
 
   _updateMonitorList(monitors) {
@@ -1249,7 +1637,7 @@ export class UltraLowLatencyPlayer {
   }
 
   _requestMonitorSwitch(index) {
-    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+    if (!this._isTransportOpen()) {
       return
     }
 

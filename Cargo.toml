@@ -15,6 +15,8 @@ hyper-util = { version = "0.1.20", features = ["full"] }
 log = "0.4.29"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
+sha2 = "0.10.9"
+time = "0.3.47"
 tokio = { version = "1.49.0", features = ["full"] }
 tokio-util = { version = "0.7.18", features = ["codec"] }
 tower-http = { version = "0.6.6", features = ["fs", "set-header"] }
@@ -29,6 +31,7 @@ windows = { version = "0.62.2", features = [
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_WindowsAndMessaging",
 ] }
-tokio-rustls = "0.26.1"
+tokio-rustls = { version = "0.26.1", default-features = false, features = ["ring", "tls12"] }
 rustls-pemfile = "2.2.0"
 rcgen = "0.14.7"
+wtransport = "0.7.0"
