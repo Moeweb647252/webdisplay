@@ -126,17 +126,31 @@ impl AmfEncoder {
         video.set_max_b_frames(0);
 
         let mut opts = Dictionary::new();
-        opts.set("usage", "ultralowlatency");
         opts.set("quality", "speed");
-        opts.set("latency", "lowest_latency");
         opts.set("rc", "vbr_latency");
-        opts.set("async_depth", "1");
-        opts.set("skip_frame", "0");
-        opts.set("preanalysis", "0");
-        opts.set("preencode", "0");
-        opts.set("bf", "0");
-        opts.set("header_insertion_mode", "gop");
-        opts.set("log_to_dbg", "0");
+        opts.set("frame_skipping", "false");
+        opts.set("preanalysis", "false");
+        opts.set("preencode", "false");
+        opts.set("filler_data", "false");
+        opts.set("log_to_dbg", "false");
+
+        match config.codec {
+            VideoCodec::Av1 => {
+                // AMF AV1 仅支持 lowlatency/transcoding usage
+                opts.set("usage", "lowlatency");
+                opts.set("header_insertion_mode", "gop");
+            }
+            VideoCodec::H264 => {
+                opts.set("usage", "ultralowlatency");
+                opts.set("vbaq", "false");
+                opts.set("bf", "0");
+            }
+            VideoCodec::H265 => {
+                opts.set("usage", "ultralowlatency");
+                opts.set("vbaq", "false");
+                opts.set("header_insertion_mode", "gop");
+            }
+        }
 
         let encoder = video.open_with(opts)?;
 
