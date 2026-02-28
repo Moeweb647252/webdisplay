@@ -6,9 +6,9 @@ use serde::{Deserialize, Serialize};
 /// ```text
 /// ┌──────────┬──────────┬──────────┬──────────┬──────────────────┐
 /// │ type (1) │ flags(1) │ seq (4)  │ pts (4)  │ payload_len (4)  │  ← 14 bytes header
-/// │          │          │          │          │ + 2 reserved      │  ← 16 bytes total
+/// │          │          │          │          │ + 2 reserved     │  ← 16 bytes total
 /// ├──────────┴──────────┴──────────┴──────────┴──────────────────┤
-/// │                     payload (variable)                        │
+/// │                     payload (variable)                       │
 /// └──────────────────────────────────────────────────────────────┘
 /// ```
 #[repr(u8)]
