@@ -7,12 +7,10 @@ use std::time::Instant;
 
 /// AV1 AMF 硬件编码器
 ///
-/// 关键编码参数的码率-质量权衡遵循：
-/// $$R(D) = \alpha \cdot e^{-\beta \cdot D}$$
-/// 其中 $R$ 为码率，$D$ 为失真度，$\alpha, \beta$ 为模型参数。
+/// 关键编码参数存在码率-质量权衡：更低失真通常需要更高码率。
 ///
 /// 在超低延迟场景下，我们牺牲部分压缩效率以换取编码速度：
-/// $$T_{encode} \propto \frac{1}{\text{preset\_speed}}$$
+/// preset_speed 越偏向 speed，单帧编码耗时通常越低。
 pub struct Av1AmfEncoder {
     encoder: ffmpeg::codec::encoder::Video,
     scaler: Option<scaling::Context>,
@@ -38,8 +36,8 @@ pub struct EncoderConfig {
     pub fps: u32,
     /// 目标码率 (bps)
     /// 推荐: 1080p@60fps → 8-15 Mbps
-    /// 计算公式: $B = W \times H \times fps \times bpp$
-    /// 其中 $bpp \approx 0.04 \sim 0.1$ (bits per pixel)
+    /// 计算公式: B = W * H * fps * bpp
+    /// 其中 bpp 约为 0.04 到 0.1 (bits per pixel)
     pub bitrate: usize,
     /// 关键帧间隔（秒）
     /// 超低延迟建议: 1-2 秒
@@ -67,7 +65,7 @@ impl Av1AmfEncoder {
     /// 3. `latency=lowest_latency` + `async_depth=1` — 限制编码队列深度
     /// 4. `rc=cbr` + `skip_frame=0` — 避免码控主动跳帧
     /// 5. `header_insertion_mode=gop` — 每个 GOP 头插入，支持随时加入
-    /// 6. 禁用 B 帧 — B 帧引入额外 $T_{reorder} = \frac{N_B}{fps}$ 延迟
+    /// 6. 禁用 B 帧 — B 帧会引入额外重排序延迟，约为 N_B / fps
     pub fn new(config: &EncoderConfig) -> Result<Self, Box<dyn std::error::Error>> {
         ffmpeg::init()?;
 
@@ -144,11 +142,11 @@ impl Av1AmfEncoder {
     /// 流程: BGRA 原始帧 → NV12 转换 → AV1 AMF 硬件编码
     ///
     /// 编码延迟由以下因素决定：
-    /// $$T_{encode} = T_{color\_convert} + T_{hw\_encode} + T_{readback}$$
+    /// T_encode = T_color_convert + T_hw_encode + T_readback
     ///
-    /// 其中 $T_{color\_convert} \approx 0.5\text{ms}$（SWS 快速双线性），
-    /// $T_{hw\_encode} \approx 3\text{ms}$（AMF 超低延迟），
-    /// $T_{readback} \approx 0.5\text{ms}$
+    /// 其中 T_color_convert 约 0.5ms（SWS 快速双线性），
+    /// T_hw_encode 约 3ms（AMF 超低延迟），
+    /// T_readback 约 0.5ms
     pub fn encode(
         &mut self,
         bgra_data: &[u8],

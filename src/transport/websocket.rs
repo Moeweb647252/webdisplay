@@ -97,7 +97,7 @@ enum MouseInputPayload {
 /// 最大传输单元考虑：
 /// 对于单帧 AV1 编码数据，在 10Mbps@60fps 下，
 /// 平均每帧大小约为:
-/// $$S_{frame} = \frac{B}{fps} = \frac{10 \times 10^6}{60} \approx 20.8 \text{KB}$$
+/// S_frame = B / fps = 10_000_000 / 60 ~= 20.8 KB
 ///
 /// WebSocket 单帧可承载此大小，无需分片。
 pub struct WebSocketServer {

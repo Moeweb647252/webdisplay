@@ -14,7 +14,7 @@ use tower_http::set_header::SetResponseHeaderLayer;
 const CONTENT_SECURITY_POLICY: &str = "script-src 'self' 'unsafe-inline' 'unsafe-eval' blob:; connect-src 'self' ws: wss:; style-src 'self' 'unsafe-inline';";
 
 fn build_router(ws_server: Arc<WebSocketServer>) -> Router {
-    let static_files = get_service(ServeDir::new("web").append_index_html_on_directories(true));
+    let static_files = get_service(ServeDir::new("web/dist").append_index_html_on_directories(true));
 
     Router::new()
         .route("/ws", get(WebSocketServer::websocket_upgrade))
