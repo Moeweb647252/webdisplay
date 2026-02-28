@@ -7,8 +7,8 @@ mod transport;
 
 use capture::dda::DdaCapture;
 use server::http::run_server;
-use transport::webtransport::WebTransportServer;
 use transport::websocket::WebSocketServer;
+use transport::webtransport::WebTransportServer;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -17,6 +17,10 @@ use std::sync::Arc;
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Setup logger with default info level
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+
+    unsafe {
+        windows::Win32::Media::timeBeginPeriod(1);
+    }
 
     log::info!("=== 串流服务器启动 ===");
 

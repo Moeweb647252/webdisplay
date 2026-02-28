@@ -22,8 +22,8 @@ const DEFAULT_KEYFRAME_INTERVAL_SECS: u32 = 2;
 const MIN_KEYFRAME_INTERVAL_SECS: u32 = 1;
 const MAX_KEYFRAME_INTERVAL_SECS: u32 = 10;
 
-/// 控制消息轮询超时
-const CONTROL_POLL_TIMEOUT: Duration = Duration::from_millis(1);
+/// 控制消息轮询超时（使用零超时避免浪费帧时间预算）
+const CONTROL_POLL_TIMEOUT: Duration = Duration::ZERO;
 
 #[derive(Debug, Clone, Copy)]
 struct EncodingSettings {
@@ -237,19 +237,19 @@ pub(crate) fn run_client_service<T: TransportIo>(
             log::info!("客户端请求关键帧");
         }
 
-        let captured = match capturer
+        let frame_ready = capturer
             .capture_frame(capture_timeout_ms)
-            .map_err(|e| e.to_string())?
-        {
-            Some(frame) => frame,
-            None => {
-                pace_frame(frame_start, frame_interval);
-                continue;
-            }
-        };
+            .map_err(|e| e.to_string())?;
+
+        if !frame_ready {
+            pace_frame(frame_start, frame_interval);
+            continue;
+        }
+
+        let nv12_data = capturer.read_nv12().map_err(|e| e.to_string())?;
 
         let encoded_frames = encoder
-            .encode(&captured.data, captured.stride, requesting_kf)
+            .encode(&nv12_data, requesting_kf)
             .map_err(|e| e.to_string())?;
 
         for ef in encoded_frames {
@@ -639,8 +639,8 @@ fn pace_frame(frame_start: Instant, frame_interval: Duration) {
     let elapsed = frame_start.elapsed();
     if elapsed < frame_interval {
         let sleep_duration = frame_interval - elapsed;
-        if sleep_duration > Duration::from_micros(500) {
-            std::thread::sleep(sleep_duration - Duration::from_micros(500));
+        if sleep_duration > Duration::from_micros(1500) {
+            std::thread::sleep(sleep_duration - Duration::from_micros(1500));
         }
         while frame_start.elapsed() < frame_interval {
             std::hint::spin_loop();

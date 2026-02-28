@@ -1,4 +1,5 @@
 use std::ffi::c_void;
+use std::mem::ManuallyDrop;
 
 use windows::Win32::Foundation::POINT;
 use windows::Win32::Graphics::Direct3D::Fxc::{
@@ -8,7 +9,7 @@ use windows::Win32::Graphics::Direct3D::*;
 use windows::Win32::Graphics::Direct3D11::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::Win32::Graphics::Dxgi::*;
-use windows::core::{Interface, PCSTR};
+use windows::core::{BOOL, Interface, PCSTR};
 
 const ROTATION_IDENTITY: u32 = 0;
 const ROTATION_90: u32 = 1;
@@ -104,7 +105,7 @@ float4 ps_main(VsOut input) : SV_TARGET {
 }
 "#;
 
-/// DDA 捕获器 —— 通过 DXGI Output Duplication 实现零拷贝屏幕捕获
+/// DDA 捕获器 —— DXGI Output Duplication + D3D11 Video Processor BGRA→NV12 全 GPU 管线
 pub struct DdaCapture {
     device: ID3D11Device,
     context: ID3D11DeviceContext,
@@ -118,7 +119,8 @@ pub struct DdaCapture {
     frame_srv: ID3D11ShaderResourceView,
     composed_texture: ID3D11Texture2D,
     composed_rtv: ID3D11RenderTargetView,
-    staging_texture: ID3D11Texture2D,
+    /// Video Processor 输出的 NV12 纹理（GPU 色彩转换结果）
+    nv12_texture: ID3D11Texture2D,
     vertex_shader: ID3D11VertexShader,
     pixel_shader: ID3D11PixelShader,
     constant_buffer: ID3D11Buffer,
@@ -126,6 +128,16 @@ pub struct DdaCapture {
     cursor_shape: Option<CursorShape>,
     cursor_visible: bool,
     cursor_pos: POINT,
+    video_device: ID3D11VideoDevice,
+    video_context: ID3D11VideoContext,
+    video_processor_enum: ID3D11VideoProcessorEnumerator,
+    video_processor: ID3D11VideoProcessor,
+    vp_output_view: ID3D11VideoProcessorOutputView,
+    vp_input_view: ID3D11VideoProcessorInputView,
+    /// 预分配的 NV12 staging 纹理（避免每帧重新创建）
+    staging_texture: ID3D11Texture2D,
+    /// 预分配的 NV12 读取缓冲区（避免每帧重新分配 Vec）
+    nv12_read_buf: Vec<u8>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -137,12 +149,6 @@ pub struct MonitorInfo {
     pub width: u32,
     pub height: u32,
     pub primary: bool,
-}
-
-/// 捕获到的帧数据
-pub struct CapturedFrame {
-    pub data: Vec<u8>,
-    pub stride: u32,
 }
 
 struct CursorShape {
@@ -323,25 +329,86 @@ impl DdaCapture {
             device.CreateRenderTargetView(&composed_texture, None, Some(&mut composed_rtv))?;
             let composed_rtv = composed_rtv.unwrap();
 
-            let staging_desc = D3D11_TEXTURE2D_DESC {
+            // ── NV12 输出纹理（Video Processor 写入，编码器读取）──
+            let nv12_desc = D3D11_TEXTURE2D_DESC {
                 Width: width,
                 Height: height,
                 MipLevels: 1,
                 ArraySize: 1,
-                Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                Format: DXGI_FORMAT_NV12,
                 SampleDesc: DXGI_SAMPLE_DESC {
                     Count: 1,
                     Quality: 0,
                 },
-                Usage: D3D11_USAGE_STAGING,
-                BindFlags: 0,
-                CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32,
+                Usage: D3D11_USAGE_DEFAULT,
+                BindFlags: D3D11_BIND_RENDER_TARGET.0 as u32,
+                CPUAccessFlags: 0,
                 MiscFlags: 0,
             };
+            let mut nv12_texture = None;
+            device.CreateTexture2D(&nv12_desc, None, Some(&mut nv12_texture))?;
+            let nv12_texture = nv12_texture.unwrap();
 
-            let mut staging_texture = None;
-            device.CreateTexture2D(&staging_desc, None, Some(&mut staging_texture))?;
-            let staging_texture = staging_texture.unwrap();
+            // ── D3D11 Video Processor 初始化 ──
+            let video_device: ID3D11VideoDevice = device.cast()?;
+            let video_context: ID3D11VideoContext = context.cast()?;
+
+            let content_desc = D3D11_VIDEO_PROCESSOR_CONTENT_DESC {
+                InputFrameFormat: D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE,
+                InputFrameRate: DXGI_RATIONAL {
+                    Numerator: 60,
+                    Denominator: 1,
+                },
+                InputWidth: width,
+                InputHeight: height,
+                OutputFrameRate: DXGI_RATIONAL {
+                    Numerator: 60,
+                    Denominator: 1,
+                },
+                OutputWidth: width,
+                OutputHeight: height,
+                Usage: D3D11_VIDEO_USAGE_PLAYBACK_NORMAL,
+            };
+            let video_processor_enum =
+                video_device.CreateVideoProcessorEnumerator(&content_desc as *const _)?;
+
+            let video_processor = video_device.CreateVideoProcessor(&video_processor_enum, 0)?;
+
+            // 输出视图（NV12 纹理）
+            let output_view_desc = D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC {
+                ViewDimension: D3D11_VPOV_DIMENSION_TEXTURE2D,
+                Anonymous: D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC_0 {
+                    Texture2D: D3D11_TEX2D_VPOV { MipSlice: 0 },
+                },
+            };
+            let mut out_view = None;
+            video_device.CreateVideoProcessorOutputView(
+                &nv12_texture,
+                &video_processor_enum,
+                &output_view_desc as *const _,
+                Some(&mut out_view),
+            )?;
+            let vp_output_view = out_view.unwrap();
+
+            // 输入视图（BGRA composed_texture）
+            let input_view_desc = D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC {
+                FourCC: 0,
+                ViewDimension: D3D11_VPIV_DIMENSION_TEXTURE2D,
+                Anonymous: D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC_0 {
+                    Texture2D: D3D11_TEX2D_VPIV {
+                        MipSlice: 0,
+                        ArraySlice: 0,
+                    },
+                },
+            };
+            let mut in_view = None;
+            video_device.CreateVideoProcessorInputView(
+                &composed_texture,
+                &video_processor_enum,
+                &input_view_desc as *const _,
+                Some(&mut in_view),
+            )?;
+            let vp_input_view = in_view.unwrap();
 
             let vs_blob = compile_shader_blob(COMPOSITE_SHADER, b"vs_main\0", b"vs_5_0\0")?;
             let ps_blob = compile_shader_blob(COMPOSITE_SHADER, b"ps_main\0", b"ps_5_0\0")?;
@@ -375,6 +442,30 @@ impl DdaCapture {
                 MaxDepth: 1.0,
             };
 
+            // ── 预分配 Staging 纹理（避免每帧 CreateTexture2D 开销）──
+            let staging_desc = D3D11_TEXTURE2D_DESC {
+                Width: width,
+                Height: height,
+                MipLevels: 1,
+                ArraySize: 1,
+                Format: DXGI_FORMAT_NV12,
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
+                Usage: D3D11_USAGE_STAGING,
+                BindFlags: 0,
+                CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32,
+                MiscFlags: 0,
+            };
+            let mut staging_texture = None;
+            device.CreateTexture2D(&staging_desc, None, Some(&mut staging_texture))?;
+            let staging_texture = staging_texture.unwrap();
+
+            // 预分配 NV12 读取缓冲区: Y (w*h) + UV (w*h/2)
+            let nv12_buf_size = (width as usize) * (height as usize) * 3 / 2;
+            let nv12_read_buf = vec![0u8; nv12_buf_size];
+
             log::info!(
                 "DDA 捕获器初始化完成: 逻辑 {}x{}, 物理 {}x{}, 旋转 {}, GPU 合成启用",
                 width,
@@ -397,7 +488,7 @@ impl DdaCapture {
                 frame_srv,
                 composed_texture,
                 composed_rtv,
-                staging_texture,
+                nv12_texture,
                 vertex_shader,
                 pixel_shader,
                 constant_buffer,
@@ -405,15 +496,21 @@ impl DdaCapture {
                 cursor_shape: None,
                 cursor_visible: false,
                 cursor_pos: POINT::default(),
+                video_device,
+                video_context,
+                video_processor_enum,
+                video_processor,
+                vp_output_view,
+                vp_input_view,
+                staging_texture,
+                nv12_read_buf,
             })
         }
     }
 
-    /// 捕获一帧
-    pub fn capture_frame(
-        &mut self,
-        timeout_ms: u32,
-    ) -> Result<Option<CapturedFrame>, Box<dyn std::error::Error>> {
+    /// 捕获一帧并通过 GPU Video Processor 转换为 NV12，写入 self.nv12_texture
+    /// 返回 true 表示新帧已就绪，false 表示超时无新帧
+    pub fn capture_frame(&mut self, timeout_ms: u32) -> Result<bool, Box<dyn std::error::Error>> {
         unsafe {
             let mut frame_info = DXGI_OUTDUPL_FRAME_INFO::default();
             let mut resource = None;
@@ -424,7 +521,7 @@ impl DdaCapture {
             {
                 Ok(()) => {}
                 Err(e) if e.code().0 as u32 == 0x887A0027 => {
-                    return Ok(None);
+                    return Ok(false); // 超时，无新帧
                 }
                 Err(e) => return Err(e.into()),
             }
@@ -438,49 +535,42 @@ impl DdaCapture {
                 self.cursor_pos = frame_info.PointerPosition.Position;
             }
 
-            let result = (|| -> Result<CapturedFrame, Box<dyn std::error::Error>> {
+            let result = (|| -> Result<(), Box<dyn std::error::Error>> {
                 let resource = resource.ok_or("AcquireNextFrame 未返回帧资源")?;
                 let texture: ID3D11Texture2D = resource.cast()?;
 
+                // GPU 合成（旋转校正 + 光标叠加）→ composed_texture (BGRA)
                 self.context.CopyResource(&self.frame_texture, &texture);
                 self.render_composite()?;
-                self.context
-                    .CopyResource(&self.staging_texture, &self.composed_texture);
 
-                let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
-                self.context.Map(
-                    &self.staging_texture,
+                // GPU Video Processor: BGRA → NV12（写入 nv12_texture）
+                let stream = D3D11_VIDEO_PROCESSOR_STREAM {
+                    Enable: BOOL(1),
+                    OutputIndex: 0,
+                    InputFrameOrField: 0,
+                    PastFrames: 0,
+                    FutureFrames: 0,
+                    ppPastSurfaces: std::ptr::null_mut(),
+                    pInputSurface: ManuallyDrop::new(Some(self.vp_input_view.clone())),
+                    ppFutureSurfaces: std::ptr::null_mut(),
+                    ppPastSurfacesRight: std::ptr::null_mut(),
+                    pInputSurfaceRight: ManuallyDrop::new(None),
+                    ppFutureSurfacesRight: std::ptr::null_mut(),
+                };
+                self.video_context.VideoProcessorBlt(
+                    &self.video_processor,
+                    &self.vp_output_view,
                     0,
-                    D3D11_MAP_READ,
-                    0,
-                    Some(&mut mapped),
+                    &[stream],
                 )?;
 
-                let row_bytes = (self.width * 4) as usize;
-                let src_stride = mapped.RowPitch as usize;
-                let src_size = src_stride * self.height as usize;
-                let src = std::slice::from_raw_parts(mapped.pData as *const u8, src_size);
-
-                let mut data = vec![0u8; row_bytes * self.height as usize];
-                for row in 0..self.height as usize {
-                    let src_start = row * src_stride;
-                    let dst_start = row * row_bytes;
-                    data[dst_start..dst_start + row_bytes]
-                        .copy_from_slice(&src[src_start..src_start + row_bytes]);
-                }
-
-                self.context.Unmap(&self.staging_texture, 0);
-
-                Ok(CapturedFrame {
-                    data,
-                    stride: self.width * 4,
-                })
+                Ok(())
             })();
 
             self.duplication.ReleaseFrame()?;
 
             match result {
-                Ok(frame) => Ok(Some(frame)),
+                Ok(()) => Ok(true),
                 Err(e) => Err(e),
             }
         }
@@ -492,6 +582,67 @@ impl DdaCapture {
 
     pub fn height(&self) -> u32 {
         self.height
+    }
+
+    /// 返回最新捕获已转换的 NV12 纹理（供编码器直接使用）
+    #[allow(dead_code)]
+    pub fn nv12_texture(&self) -> &ID3D11Texture2D {
+        &self.nv12_texture
+    }
+
+    /// 返回 D3D11 device（供编码器共享，建立 hw_frames_ctx）
+    #[allow(dead_code)]
+    pub fn device(&self) -> &ID3D11Device {
+        &self.device
+    }
+
+    /// 将 nv12_texture 经由预分配的 Staging 纹理回读到 CPU，返回完整 NV12 字节流
+    /// 布局：Y 面 (width×height) 字节 + UV 面 (width×height/2) 字节（交错）
+    pub fn read_nv12(&mut self) -> Result<&[u8], Box<dyn std::error::Error>> {
+        unsafe {
+            self.context
+                .CopyResource(&self.staging_texture, &self.nv12_texture);
+
+            // NV12 staging textures: map subresource 0 only.
+            // Both planes are accessible from the single mapped pointer:
+            //   Y  rows: pData + row * RowPitch
+            //   UV rows: pData + RowPitch*Height + row * RowPitch
+            // Mapping subresource 1 separately returns E_INVALIDARG on most drivers.
+            let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+            self.context
+                .Map(&self.staging_texture, 0, D3D11_MAP_READ, 0, Some(&mut mapped))?;
+
+            let w = self.width as usize;
+            let h = self.height as usize;
+            let row_pitch = mapped.RowPitch as usize;
+            let base_ptr = mapped.pData as *const u8;
+
+            if row_pitch == w {
+                // Fast path: stride == width, 直接连续拷贝整个 Y+UV 面
+                let total = w * h + w * (h / 2);
+                let src = std::slice::from_raw_parts(base_ptr, total);
+                self.nv12_read_buf[..total].copy_from_slice(src);
+            } else {
+                // Slow path: stride != width, 逐行拷贝
+                // Y plane — rows 0..h
+                for row in 0..h {
+                    let src = std::slice::from_raw_parts(base_ptr.add(row * row_pitch), w);
+                    self.nv12_read_buf[row * w..(row + 1) * w].copy_from_slice(src);
+                }
+
+                // UV plane — interleaved, rows 0..h/2, starts at RowPitch * Height
+                let uv_base = base_ptr.add(row_pitch * h);
+                let uv_start = w * h;
+                for row in 0..(h / 2) {
+                    let src = std::slice::from_raw_parts(uv_base.add(row * row_pitch), w);
+                    self.nv12_read_buf[uv_start + row * w..uv_start + (row + 1) * w]
+                        .copy_from_slice(src);
+                }
+            }
+
+            self.context.Unmap(&self.staging_texture, 0);
+            Ok(&self.nv12_read_buf)
+        }
     }
 
     fn update_cursor_shape(

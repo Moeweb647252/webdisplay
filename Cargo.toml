@@ -30,8 +30,12 @@ windows = { version = "0.62.2", features = [
     "Win32_Graphics_Gdi",
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_WindowsAndMessaging",
+    "Win32_Media",
 ] }
-tokio-rustls = { version = "0.26.1", default-features = false, features = ["ring", "tls12"] }
+tokio-rustls = { version = "0.26.1", default-features = false, features = [
+    "ring",
+    "tls12",
+] }
 rustls-pemfile = "2.2.0"
 rcgen = "0.14.7"
 wtransport = "0.7.0"

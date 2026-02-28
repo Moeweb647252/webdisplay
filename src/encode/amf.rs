@@ -1,7 +1,6 @@
 use ffmpeg_next as ffmpeg;
 use ffmpeg_next::codec;
 use ffmpeg_next::format::Pixel;
-use ffmpeg_next::software::scaling;
 use ffmpeg_next::{Dictionary, Rational};
 use std::fmt;
 use std::time::Instant;
@@ -55,14 +54,13 @@ impl fmt::Display for VideoCodec {
     }
 }
 
-/// AMF 硬件编码器
+/// AMF 硬件编码器（输入 NV12 字节流，无 swscale，比原来的 BGRA 路径少 62.5% 内存传输）
 pub struct AmfEncoder {
     encoder: ffmpeg::codec::encoder::Video,
-    scaler: Option<scaling::Context>,
     frame_index: i64,
     width: u32,
     height: u32,
-    src_frame: ffmpeg::frame::Video,
+    /// 复用 NV12 frame，避免每帧重新分配
     nv12_frame: ffmpeg::frame::Video,
 }
 
@@ -100,7 +98,7 @@ impl Default for EncoderConfig {
 }
 
 impl AmfEncoder {
-    /// 创建 AMF 编码器
+    /// 创建 AMF 编码器（直接接受 NV12 输入，无 swscale 色彩转换开销）
     pub fn new(config: &EncoderConfig) -> Result<Self, Box<dyn std::error::Error>> {
         ffmpeg::init()?;
 
@@ -117,6 +115,7 @@ impl AmfEncoder {
 
         video.set_width(config.width);
         video.set_height(config.height);
+        // 直接使用 NV12，AMF 原生支持，无需 swscale 转换
         video.set_format(Pixel::NV12);
         video.set_time_base(Rational::new(1, config.fps as i32));
         video.set_frame_rate(Some(Rational::new(config.fps as i32, 1)));
@@ -136,7 +135,6 @@ impl AmfEncoder {
 
         match config.codec {
             VideoCodec::Av1 => {
-                // AMF AV1 仅支持 lowlatency/transcoding usage
                 opts.set("usage", "lowlatency");
                 opts.set("header_insertion_mode", "gop");
             }
@@ -154,18 +152,8 @@ impl AmfEncoder {
 
         let encoder = video.open_with(opts)?;
 
-        let scaler = scaling::Context::get(
-            Pixel::BGRA,
-            config.width,
-            config.height,
-            Pixel::NV12,
-            config.width,
-            config.height,
-            scaling::Flags::FAST_BILINEAR,
-        )?;
-
         log::info!(
-            "{} AMF 编码器初始化: {}x{} @{}fps, 码率: {} Mbps",
+            "{} AMF 编码器初始化: {}x{} @{}fps, 码率: {} Mbps（NV12 直通，无 swscale）",
             config.codec,
             config.width,
             config.height,
@@ -173,42 +161,53 @@ impl AmfEncoder {
             config.bitrate / 1_000_000
         );
 
-        let src_frame = ffmpeg::frame::Video::new(Pixel::BGRA, config.width, config.height);
         let nv12_frame = ffmpeg::frame::Video::new(Pixel::NV12, config.width, config.height);
 
         Ok(Self {
             encoder,
-            scaler: Some(scaler),
             frame_index: 0,
             width: config.width,
             height: config.height,
-            src_frame,
             nv12_frame,
         })
     }
 
-    /// 编码一帧 BGRA 数据
+    /// 编码一帧 NV12 数据（GPU 已在 dda.rs 完成 BGRA→NV12 转换）
+    ///
+    /// `nv12_data` 布局：Y 面 width×height 字节，之后 UV 面 width×height/2 字节（交错）
     pub fn encode(
         &mut self,
-        bgra_data: &[u8],
-        stride: u32,
+        nv12_data: &[u8],
         force_keyframe: bool,
     ) -> Result<Vec<EncodedFrame>, Box<dyn std::error::Error>> {
         let encode_start = Instant::now();
 
-        let dst_linesize = self.src_frame.stride(0);
-        let row_bytes = (self.width * 4) as usize;
-        let dst_data = self.src_frame.data_mut(0);
+        // 将 NV12 字节流写入 ffmpeg frame——Y 面
+        let y_stride = self.nv12_frame.stride(0);
+        let uv_stride = self.nv12_frame.stride(1);
+        let width = self.width as usize;
+        let height = self.height as usize;
 
-        for y in 0..self.height as usize {
-            let src_offset = y * stride as usize;
-            let dst_offset = y * dst_linesize;
-            dst_data[dst_offset..dst_offset + row_bytes]
-                .copy_from_slice(&bgra_data[src_offset..src_offset + row_bytes]);
+        {
+            let y_dst = self.nv12_frame.data_mut(0);
+            let y_src = &nv12_data[..width * height];
+            for row in 0..height {
+                let src = &y_src[row * width..(row + 1) * width];
+                let dst_off = row * y_stride;
+                y_dst[dst_off..dst_off + width].copy_from_slice(src);
+            }
         }
 
-        if let Some(ref mut scaler) = self.scaler {
-            scaler.run(&self.src_frame, &mut self.nv12_frame)?;
+        // UV 面（交错，每行 width 字节，高 height/2）
+        {
+            let uv_dst = self.nv12_frame.data_mut(1);
+            let uv_src = &nv12_data[width * height..];
+            let uv_rows = height / 2;
+            for row in 0..uv_rows {
+                let src = &uv_src[row * width..(row + 1) * width];
+                let dst_off = row * uv_stride;
+                uv_dst[dst_off..dst_off + width].copy_from_slice(src);
+            }
         }
 
         self.nv12_frame.set_pts(Some(self.frame_index));
