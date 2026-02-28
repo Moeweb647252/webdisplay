@@ -1,1 +1,1 @@
-pub mod av1_amf;
+pub mod amf;

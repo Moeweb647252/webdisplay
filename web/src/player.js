@@ -5,7 +5,26 @@ const SERVER_FPS = 60
 const FRAME_TIMESTAMP_US = Math.round(1_000_000 / SERVER_FPS)
 const BASE_CONTROL_HINT = 'Moonlight 快捷键: Ctrl+Alt+Shift+Z 接管/释放 · S 统计 · X 全屏 · M 显示器 · E 编码 · Q 断开/重连'
 
+const CODEC_PRESETS = Object.freeze([
+  {
+    id: 'av1',
+    label: 'AV1',
+    decoderCandidates: ['av01.0.08M.08'],
+  },
+  {
+    id: 'h265',
+    label: 'H.265 / HEVC',
+    decoderCandidates: ['hvc1.1.6.L93.B0', 'hev1.1.6.L93.B0'],
+  },
+  {
+    id: 'h264',
+    label: 'H.264 / AVC',
+    decoderCandidates: ['avc1.640028', 'avc1.4D401F', 'avc1.42E01E'],
+  },
+])
+
 const ENCODING_DEFAULTS = Object.freeze({
+  codec: 'av1',
   fps: 60,
   bitrateMbps: 20,
   keyframeInterval: 2,
@@ -35,6 +54,7 @@ const PLAYER_GLOBAL_KEY = '__webdisplayPlayer'
 
 export const createUiState = () =>
   reactive({
+    availableCodecs: [],
     overlayVisible: true,
     connectionVisible: true,
     connected: false,
@@ -102,6 +122,9 @@ export class UltraLowLatencyPlayer {
     this.textDecoder = new TextDecoder()
     this.canvas.tabIndex = 0
 
+    this.supportedCodecConfigs = new Map()
+    this.activeDecoderCodecId = null
+
     this.encodingSettings = { ...ENCODING_DEFAULTS }
     this.ui.encodingDraft = { ...this.encodingSettings }
     this.ui.controlHintText = BASE_CONTROL_HINT
@@ -159,6 +182,7 @@ export class UltraLowLatencyPlayer {
       }
     }
     this.decoder = null
+    this.activeDecoderCodecId = null
 
     this._deactivateControl()
 
@@ -186,22 +210,35 @@ export class UltraLowLatencyPlayer {
       return
     }
 
-    const support = await VideoDecoder.isConfigSupported({
-      codec: 'av01.0.08M.08',
-      hardwareAcceleration: 'prefer-hardware',
-    })
-
-    if (!support.supported) {
+    const supportedCodecs = await this._detectSupportedCodecs()
+    if (supportedCodecs.length === 0) {
       this._setConnectionState({
         visible: true,
         connected: false,
-        text: '❌ 浏览器不支持 AV1 硬件解码',
+        text: '❌ 浏览器不支持 AV1 / H.265 / H.264 硬件解码',
         detail: '',
       })
       return
     }
 
-    this._initDecoder()
+    this.supportedCodecConfigs.clear()
+    for (const item of supportedCodecs) {
+      this.supportedCodecConfigs.set(item.id, item)
+    }
+
+    this.ui.availableCodecs = supportedCodecs.map((item) => ({
+      id: item.id,
+      label: item.label,
+    }))
+
+    const initialCodec = supportedCodecs[0].id
+    this.encodingSettings = {
+      ...ENCODING_DEFAULTS,
+      codec: initialCodec,
+    }
+    this.ui.encodingDraft = { ...this.encodingSettings }
+
+    this._initDecoder(initialCodec)
     this._connect()
     requestAnimationFrame(this.renderBound)
     this._startStatsUpdate()
@@ -209,7 +246,69 @@ export class UltraLowLatencyPlayer {
     this._showControlHint(4500)
   }
 
-  _initDecoder() {
+  async _detectSupportedCodecs() {
+    const supported = []
+
+    for (const preset of CODEC_PRESETS) {
+      const decoderCodec = await this._detectDecoderCodec(preset.decoderCandidates)
+      if (!decoderCodec) {
+        continue
+      }
+
+      supported.push({
+        id: preset.id,
+        label: preset.label,
+        decoderCodec,
+      })
+    }
+
+    return supported
+  }
+
+  async _detectDecoderCodec(candidates) {
+    for (const codec of candidates) {
+      try {
+        const support = await VideoDecoder.isConfigSupported({
+          codec,
+          hardwareAcceleration: 'prefer-hardware',
+          optimizeForLatency: true,
+        })
+        if (support.supported) {
+          return codec
+        }
+      } catch (_) {
+      }
+    }
+
+    return null
+  }
+
+  _codecLabel(codecId) {
+    const config = this.supportedCodecConfigs.get(codecId)
+    if (config) {
+      return config.label
+    }
+
+    const preset = CODEC_PRESETS.find((item) => item.id === codecId)
+    return preset ? preset.label : codecId
+  }
+
+  _resolveDecoderCodec(codecId) {
+    const config = this.supportedCodecConfigs.get(codecId)
+    return config ? config.decoderCodec : null
+  }
+
+  _initDecoder(codecId = this.encodingSettings.codec) {
+    const decoderCodec = this._resolveDecoderCodec(codecId)
+    if (!decoderCodec) {
+      throw new Error(`未找到可用解码配置: ${codecId}`)
+    }
+
+    if (this.pendingFrame) {
+      this.pendingFrame.close()
+      this.pendingFrame = null
+    }
+
     this.decoder = new VideoDecoder({
       output: (frame) => {
         const oldFrame = this.pendingFrame
@@ -228,12 +327,28 @@ export class UltraLowLatencyPlayer {
     })
 
     this.decoder.configure({
-      codec: 'av01.0.08M.08',
+      codec: decoderCodec,
       hardwareAcceleration: 'prefer-hardware',
       optimizeForLatency: true,
     })
 
-    console.log('AV1 解码器已初始化 (硬件加速, 低延迟模式)')
+    this.activeDecoderCodecId = codecId
+    console.log(`${this._codecLabel(codecId)} 解码器已初始化 (硬件加速, 低延迟模式)`)
+  }
+
+  _switchDecoder(codecId) {
+    if (codecId === this.activeDecoderCodecId && this.decoder && this.decoder.state === 'configured') {
+      return
+    }
+
+    if (this.decoder && this.decoder.state !== 'closed') {
+      try {
+        this.decoder.close()
+      } catch (_) {
+      }
+    }
+    this.decoder = null
+    this._initDecoder(codecId)
   }
 
   _connect() {
@@ -324,10 +439,25 @@ export class UltraLowLatencyPlayer {
     return Math.min(Math.max(value, min), max)
   }
 
+  _normalizeCodecId(rawCodec, fallbackCodec) {
+    if (typeof rawCodec !== 'string') {
+      return fallbackCodec
+    }
+
+    const nextCodec = rawCodec.trim().toLowerCase()
+    if (this.supportedCodecConfigs.size === 0) {
+      return CODEC_PRESETS.some((item) => item.id === nextCodec) ? nextCodec : fallbackCodec
+    }
+
+    return this.supportedCodecConfigs.has(nextCodec) ? nextCodec : fallbackCodec
+  }
+
   _normalizeEncodingDraft(draft, fallback = ENCODING_DEFAULTS) {
     const source = draft && typeof draft === 'object' ? draft : {}
+    const fallbackCodec = this._normalizeCodecId(fallback.codec, ENCODING_DEFAULTS.codec)
 
     return {
+      codec: this._normalizeCodecId(source.codec, fallbackCodec),
       bitrateMbps: this._clampInt(
         source.bitrateMbps,
         ENCODING_LIMITS.bitrateMbps.min,
@@ -349,7 +479,10 @@ export class UltraLowLatencyPlayer {
   }
 
   resetEncodingSettings() {
-    this.ui.encodingDraft = { ...ENCODING_DEFAULTS }
+    this.ui.encodingDraft = {
+      ...ENCODING_DEFAULTS,
+      codec: this.encodingSettings.codec,
+    }
     this._applyEncodingSettings()
   }
 
@@ -363,6 +496,7 @@ export class UltraLowLatencyPlayer {
     }
 
     this._sendJsonControlPacket(FRAME_TYPE.ENCODING_SETTINGS, {
+      codec: this.encodingSettings.codec,
       fps: this.encodingSettings.fps,
       bitrate: this.encodingSettings.bitrateMbps * 1_000_000,
       keyframe_interval: this.encodingSettings.keyframeInterval,
@@ -377,14 +511,48 @@ export class UltraLowLatencyPlayer {
 
   _applyEncodingSettings() {
     const normalized = this._normalizeEncodingDraft(this.ui.encodingDraft, this.encodingSettings)
+    const codecChanged = normalized.codec !== this.encodingSettings.codec
+
     this.encodingSettings = { ...normalized }
     this.ui.encodingDraft = { ...normalized }
 
+    if (codecChanged) {
+      this._switchDecoder(this.encodingSettings.codec)
+    }
+
     const syncOk = this._syncEncodingSettings(true)
+    const codecLabel = this._codecLabel(this.encodingSettings.codec)
     if (syncOk) {
-      this._flashHint(`编码设置已应用: ${this.encodingSettings.fps}fps / ${this.encodingSettings.bitrateMbps}Mbps`)
+      this._flashHint(
+        `编码设置已应用: ${codecLabel} / ${this.encodingSettings.fps}fps / ${this.encodingSettings.bitrateMbps}Mbps`,
+      )
     } else {
       this._flashHint('编码设置已保存，将在重连后自动应用')
+    }
+  }
+
+  _applyServerEncodingSettings(payload) {
+    const bitrateMbps = Number.isFinite(payload?.bitrate)
+      ? Math.round(Number(payload.bitrate) / 1_000_000)
+      : undefined
+
+    const normalized = this._normalizeEncodingDraft(
+      {
+        codec: payload?.codec,
+        fps: payload?.fps,
+        bitrateMbps,
+        keyframeInterval: payload?.keyframe_interval,
+      },
+      this.encodingSettings,
+    )
+
+    const codecChanged = normalized.codec !== this.encodingSettings.codec
+    this.encodingSettings = { ...normalized }
+    this.ui.encodingDraft = { ...normalized }
+
+    if (codecChanged) {
+      this._switchDecoder(this.encodingSettings.codec)
+      this._requestKeyframe()
     }
   }
 
@@ -969,6 +1137,17 @@ export class UltraLowLatencyPlayer {
       return
     }
 
+    if (frameType === FRAME_TYPE.ENCODING_SETTINGS) {
+      try {
+        const jsonStr = this.textDecoder.decode(payload)
+        const settings = JSON.parse(jsonStr)
+        this._applyServerEncodingSettings(settings)
+      } catch (error) {
+        console.error('解析编码设置失败', error)
+      }
+      return
+    }
+
     if (frameType !== FRAME_TYPE.VIDEO) {
       return
     }
@@ -1033,7 +1212,8 @@ export class UltraLowLatencyPlayer {
     }
 
     this.decoder = null
-    this._initDecoder()
+    const codecId = this.activeDecoderCodecId || this.encodingSettings.codec
+    this._initDecoder(codecId)
   }
 
   _requestKeyframe() {

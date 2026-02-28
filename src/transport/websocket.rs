@@ -1,5 +1,5 @@
 use crate::capture::dda::{DdaCapture, MonitorInfo};
-use crate::encode::av1_amf::{Av1AmfEncoder, EncoderConfig};
+use crate::encode::amf::{AmfEncoder, EncoderConfig, VideoCodec};
 use crate::input::win32::{ActiveMonitor, InputInjector};
 use crate::protocol::frame::{FrameFlags, FrameHeader, FrameType};
 use axum::extract::State;
@@ -8,6 +8,7 @@ use axum::response::IntoResponse;
 use futures_util::StreamExt;
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
+use serde::Serialize;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -31,6 +32,7 @@ const CONTROL_POLL_TIMEOUT: Duration = Duration::from_millis(1);
 
 #[derive(Debug, Clone, Copy)]
 struct EncodingSettings {
+    codec: VideoCodec,
     fps: u32,
     bitrate: usize,
     keyframe_interval_secs: u32,
@@ -39,6 +41,7 @@ struct EncodingSettings {
 impl Default for EncodingSettings {
     fn default() -> Self {
         Self {
+            codec: VideoCodec::Av1,
             fps: DEFAULT_TARGET_FPS,
             bitrate: DEFAULT_TARGET_BITRATE,
             keyframe_interval_secs: DEFAULT_KEYFRAME_INTERVAL_SECS,
@@ -51,6 +54,16 @@ struct EncodingSettingsPayload {
     fps: u32,
     bitrate: u32,
     keyframe_interval: u32,
+    #[serde(default)]
+    codec: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct EncodingSettingsStatePayload {
+    fps: u32,
+    bitrate: u32,
+    keyframe_interval: u32,
+    codec: &'static str,
 }
 
 enum ClientConnectionState {
@@ -95,7 +108,7 @@ enum MouseInputPayload {
 /// WebSocket 串流服务器
 ///
 /// 最大传输单元考虑：
-/// 对于单帧 AV1 编码数据，在 10Mbps@60fps 下，
+/// 对于单帧编码数据，在 10Mbps@60fps 下，
 /// 平均每帧大小约为:
 /// S_frame = B / fps = 10_000_000 / 60 ~= 20.8 KB
 ///
@@ -157,7 +170,7 @@ impl WebSocketServer {
 
         let mut current_monitor_index = 0;
         let mut capturer = DdaCapture::new(current_monitor_index).map_err(|e| e.to_string())?;
-        let mut encoder = Av1AmfEncoder::new(&Self::encoder_config(
+        let mut encoder = AmfEncoder::new(&Self::encoder_config(
             capturer.width(),
             capturer.height(),
             encoding_settings,
@@ -188,12 +201,19 @@ impl WebSocketServer {
         let mut total_encode_time_us: u64 = 0;
 
         log::info!(
-            "客户端独立服务启动: monitor {}, {}x{} @{}fps",
+            "客户端独立服务启动: monitor {}, {}x{} @{}fps, codec {}",
             current_monitor_index,
             capturer.width(),
             capturer.height(),
-            encoding_settings.fps
+            encoding_settings.fps,
+            encoding_settings.codec
         );
+
+        if let Err(e) = Self::send_encoding_settings_state(&runtime, &mut socket, encoding_settings)
+        {
+            log::warn!("发送初始编码设置失败: {}", e);
+            return Ok(());
+        }
 
         loop {
             match Self::drain_control_messages(
@@ -241,6 +261,13 @@ impl WebSocketServer {
                     frame_interval = Self::frame_interval_for_fps(encoding_settings.fps);
                     capture_timeout_ms = Self::capture_timeout_ms_for_fps(encoding_settings.fps);
                     force_keyframe = true;
+                }
+
+                if Self::send_encoding_settings_state(&runtime, &mut socket, encoding_settings)
+                    .is_err()
+                {
+                    log::info!("客户端已断开");
+                    return Ok(());
                 }
             }
 
@@ -321,6 +348,34 @@ impl WebSocketServer {
             return Err(e);
         }
         Ok(())
+    }
+
+    fn send_encoding_settings_state(
+        runtime: &tokio::runtime::Handle,
+        socket: &mut WebSocket,
+        settings: EncodingSettings,
+    ) -> Result<(), String> {
+        let payload = EncodingSettingsStatePayload {
+            fps: settings.fps,
+            bitrate: settings.bitrate as u32,
+            keyframe_interval: settings.keyframe_interval_secs,
+            codec: settings.codec.as_client_name(),
+        };
+
+        let payload_bytes = serde_json::to_vec(&payload).map_err(|e| e.to_string())?;
+        let header = FrameHeader {
+            frame_type: FrameType::EncodingSettings,
+            flags: FrameFlags::empty(),
+            sequence: 0,
+            pts: 0,
+            payload_len: payload_bytes.len() as u32,
+        };
+
+        let mut packet = Vec::with_capacity(FrameHeader::SIZE + payload_bytes.len());
+        packet.extend_from_slice(&header.to_bytes());
+        packet.extend_from_slice(&payload_bytes);
+
+        Self::send_binary_packet(runtime, socket, packet)
     }
 
     fn send_binary_packet(
@@ -468,11 +523,23 @@ impl WebSocketServer {
     fn apply_encoding_settings(
         payload: EncodingSettingsPayload,
         encoding_settings: &mut EncodingSettings,
-        encoder: &mut Av1AmfEncoder,
+        encoder: &mut AmfEncoder,
         width: u32,
         height: u32,
     ) -> bool {
+        let next_codec = match payload.codec.as_deref() {
+            Some(raw_codec) => match VideoCodec::from_client_name(raw_codec) {
+                Some(codec) => codec,
+                None => {
+                    log::warn!("忽略未知编码格式: {}", raw_codec);
+                    encoding_settings.codec
+                }
+            },
+            None => encoding_settings.codec,
+        };
+
         let next_settings = EncodingSettings {
+            codec: next_codec,
             fps: payload.fps.clamp(MIN_TARGET_FPS, MAX_TARGET_FPS),
             bitrate: (payload.bitrate as usize).clamp(MIN_TARGET_BITRATE, MAX_TARGET_BITRATE),
             keyframe_interval_secs: payload
@@ -480,19 +547,21 @@ impl WebSocketServer {
                 .clamp(MIN_KEYFRAME_INTERVAL_SECS, MAX_KEYFRAME_INTERVAL_SECS),
         };
 
-        if next_settings.fps == encoding_settings.fps
+        if next_settings.codec == encoding_settings.codec
+            && next_settings.fps == encoding_settings.fps
             && next_settings.bitrate == encoding_settings.bitrate
             && next_settings.keyframe_interval_secs == encoding_settings.keyframe_interval_secs
         {
             return false;
         }
 
-        match Av1AmfEncoder::new(&Self::encoder_config(width, height, next_settings)) {
+        match AmfEncoder::new(&Self::encoder_config(width, height, next_settings)) {
             Ok(new_encoder) => {
                 *encoder = new_encoder;
                 *encoding_settings = next_settings;
                 log::info!(
-                    "编码设置已更新: {}fps, {}Mbps, 关键帧间隔 {}s",
+                    "编码设置已更新: {}, {}fps, {}Mbps, 关键帧间隔 {}s",
+                    next_settings.codec,
                     next_settings.fps,
                     next_settings.bitrate / 1_000_000,
                     next_settings.keyframe_interval_secs
@@ -520,7 +589,7 @@ impl WebSocketServer {
         new_index: u32,
         current_monitor_index: &mut u32,
         capturer: &mut DdaCapture,
-        encoder: &mut Av1AmfEncoder,
+        encoder: &mut AmfEncoder,
         encoding_settings: EncodingSettings,
     ) -> Result<bool, String> {
         if new_index == *current_monitor_index {
@@ -536,7 +605,7 @@ impl WebSocketServer {
             }
         };
 
-        let new_encoder = match Av1AmfEncoder::new(&Self::encoder_config(
+        let new_encoder = match AmfEncoder::new(&Self::encoder_config(
             new_capturer.width(),
             new_capturer.height(),
             encoding_settings,
@@ -576,6 +645,7 @@ impl WebSocketServer {
 
     fn encoder_config(width: u32, height: u32, settings: EncodingSettings) -> EncoderConfig {
         EncoderConfig {
+            codec: settings.codec,
             width,
             height,
             fps: settings.fps,

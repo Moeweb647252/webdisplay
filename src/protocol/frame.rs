@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum FrameType {
-    /// AV1 视频帧
+    /// 视频帧（编码格式由会话设置决定）
     VideoFrame = 0x01,
     /// 关键帧请求（客户端 → 服务端）
     KeyframeRequest = 0x02,
@@ -28,7 +28,7 @@ pub enum FrameType {
     MouseInput = 0x06,
     /// 键盘输入 (客户端 → 服务端)
     KeyboardInput = 0x07,
-    /// 编码参数设置 (客户端 → 服务端)
+    /// 编码参数设置（双向：客户端请求 / 服务端回执）
     EncodingSettings = 0x08,
     /// 心跳包
     Ping = 0x10,

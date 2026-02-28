@@ -41,6 +41,11 @@ const resetEncoding = () => {
     player.resetEncodingSettings()
   }
 }
+
+const codecLabel = (codecId) => {
+  const matched = state.availableCodecs.find((item) => item.id === codecId)
+  return matched ? matched.label : '--'
+}
 </script>
 
 <template>
@@ -103,6 +108,19 @@ const resetEncoding = () => {
 
     <div id="encoding-panel" :class="{ hidden: !state.encodingPanelVisible }">
       <h3>编码设置</h3>
+
+      <div class="encoding-field">
+        <div class="encoding-label">
+          <label for="encoding-codec">编码格式</label>
+          <span class="encoding-label-value">{{ codecLabel(state.encodingDraft.codec) }}</span>
+        </div>
+        <select id="encoding-codec" v-model="state.encodingDraft.codec">
+          <option v-if="state.availableCodecs.length === 0" disabled value="">检测中...</option>
+          <option v-for="codec in state.availableCodecs" :key="codec.id" :value="codec.id">
+            {{ codec.label }}
+          </option>
+        </select>
+      </div>
 
       <div class="encoding-field">
         <div class="encoding-label">
@@ -420,6 +438,16 @@ body {
 }
 
 .encoding-field input[type='number'] {
+  width: 100%;
+  padding: 6px 8px;
+  border-radius: 6px;
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  background: rgba(255, 255, 255, 0.08);
+  color: #fff;
+  font-size: 13px;
+}
+
+.encoding-field select {
   width: 100%;
   padding: 6px 8px;
   border-radius: 6px;
