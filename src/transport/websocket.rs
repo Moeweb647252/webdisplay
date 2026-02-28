@@ -11,20 +11,47 @@ use serde::de::DeserializeOwned;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-/// 目标帧率
-const TARGET_FPS: u32 = 60;
-/// 帧间隔
-/// $$\Delta t = \frac{1}{fps} = \frac{1}{60} \approx 16.67\text{ms}$$
-const FRAME_INTERVAL: Duration = Duration::from_micros(1_000_000 / TARGET_FPS as u64);
-/// DDA 捕获等待超时（毫秒）
-/// 需要向上取整，避免 60fps 时用 16ms 发生周期性超时。
-const CAPTURE_TIMEOUT_MS: u32 = (1_000u32 + TARGET_FPS - 1) / TARGET_FPS + 1;
-/// 目标码率 (bps)
-const TARGET_BITRATE: usize = 20_000_000;
-/// 关键帧间隔（秒）
-const KEYFRAME_INTERVAL_SECS: u32 = 2;
+/// 默认目标帧率
+const DEFAULT_TARGET_FPS: u32 = 60;
+const MIN_TARGET_FPS: u32 = 24;
+const MAX_TARGET_FPS: u32 = 120;
+
+/// 默认目标码率 (bps)
+const DEFAULT_TARGET_BITRATE: usize = 20_000_000;
+const MIN_TARGET_BITRATE: usize = 2_000_000;
+const MAX_TARGET_BITRATE: usize = 80_000_000;
+
+/// 默认关键帧间隔（秒）
+const DEFAULT_KEYFRAME_INTERVAL_SECS: u32 = 2;
+const MIN_KEYFRAME_INTERVAL_SECS: u32 = 1;
+const MAX_KEYFRAME_INTERVAL_SECS: u32 = 10;
+
 /// 控制消息轮询超时
 const CONTROL_POLL_TIMEOUT: Duration = Duration::from_millis(1);
+
+#[derive(Debug, Clone, Copy)]
+struct EncodingSettings {
+    fps: u32,
+    bitrate: usize,
+    keyframe_interval_secs: u32,
+}
+
+impl Default for EncodingSettings {
+    fn default() -> Self {
+        Self {
+            fps: DEFAULT_TARGET_FPS,
+            bitrate: DEFAULT_TARGET_BITRATE,
+            keyframe_interval_secs: DEFAULT_KEYFRAME_INTERVAL_SECS,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct EncodingSettingsPayload {
+    fps: u32,
+    bitrate: u32,
+    keyframe_interval: u32,
+}
 
 enum ClientConnectionState {
     Alive,
@@ -124,11 +151,18 @@ impl WebSocketServer {
         // 建立连接后立即发送显示器列表
         Self::send_monitor_list(&runtime, &mut socket, monitor_list_json.as_ref())?;
 
+        let mut encoding_settings = EncodingSettings::default();
+        let mut frame_interval = Self::frame_interval_for_fps(encoding_settings.fps);
+        let mut capture_timeout_ms = Self::capture_timeout_ms_for_fps(encoding_settings.fps);
+
         let mut current_monitor_index = 0;
         let mut capturer = DdaCapture::new(current_monitor_index).map_err(|e| e.to_string())?;
-        let mut encoder =
-            Av1AmfEncoder::new(&Self::encoder_config(capturer.width(), capturer.height()))
-                .map_err(|e| e.to_string())?;
+        let mut encoder = Av1AmfEncoder::new(&Self::encoder_config(
+            capturer.width(),
+            capturer.height(),
+            encoding_settings,
+        ))
+        .map_err(|e| e.to_string())?;
         let mut active_monitor = Self::active_monitor(
             monitors.as_ref(),
             current_monitor_index,
@@ -146,6 +180,7 @@ impl WebSocketServer {
 
         let mut force_keyframe = true;
         let mut pending_monitor_switch = None::<u32>;
+        let mut pending_encoding_settings = None::<EncodingSettingsPayload>;
         let mut frame_seq = 0u32;
 
         let mut stats_interval = Instant::now();
@@ -157,7 +192,7 @@ impl WebSocketServer {
             current_monitor_index,
             capturer.width(),
             capturer.height(),
-            TARGET_FPS
+            encoding_settings.fps
         );
 
         loop {
@@ -166,6 +201,7 @@ impl WebSocketServer {
                 &mut socket,
                 &mut force_keyframe,
                 &mut pending_monitor_switch,
+                &mut pending_encoding_settings,
                 input_injector.as_ref(),
                 active_monitor,
             )? {
@@ -182,6 +218,7 @@ impl WebSocketServer {
                     &mut current_monitor_index,
                     &mut capturer,
                     &mut encoder,
+                    encoding_settings,
                 )? {
                     force_keyframe = true;
                     active_monitor = Self::active_monitor(
@@ -193,6 +230,20 @@ impl WebSocketServer {
                 }
             }
 
+            if let Some(payload) = pending_encoding_settings.take() {
+                if Self::apply_encoding_settings(
+                    payload,
+                    &mut encoding_settings,
+                    &mut encoder,
+                    capturer.width(),
+                    capturer.height(),
+                ) {
+                    frame_interval = Self::frame_interval_for_fps(encoding_settings.fps);
+                    capture_timeout_ms = Self::capture_timeout_ms_for_fps(encoding_settings.fps);
+                    force_keyframe = true;
+                }
+            }
+
             let frame_start = Instant::now();
 
             let requesting_kf = std::mem::take(&mut force_keyframe);
@@ -201,12 +252,12 @@ impl WebSocketServer {
             }
 
             let captured = match capturer
-                .capture_frame(CAPTURE_TIMEOUT_MS)
+                .capture_frame(capture_timeout_ms)
                 .map_err(|e| e.to_string())?
             {
                 Some(frame) => frame,
                 None => {
-                    Self::pace_frame(frame_start);
+                    Self::pace_frame(frame_start, frame_interval);
                     continue;
                 }
             };
@@ -245,7 +296,7 @@ impl WebSocketServer {
                 total_encode_time_us = 0;
             }
 
-            Self::pace_frame(frame_start);
+            Self::pace_frame(frame_start, frame_interval);
         }
     }
 
@@ -287,6 +338,7 @@ impl WebSocketServer {
         socket: &mut WebSocket,
         force_keyframe: &mut bool,
         pending_monitor_switch: &mut Option<u32>,
+        pending_encoding_settings: &mut Option<EncodingSettingsPayload>,
         input_injector: Option<&InputInjector>,
         active_monitor: ActiveMonitor,
     ) -> Result<ClientConnectionState, String> {
@@ -303,6 +355,7 @@ impl WebSocketServer {
                         &data,
                         force_keyframe,
                         pending_monitor_switch,
+                        pending_encoding_settings,
                         input_injector,
                         active_monitor,
                     );
@@ -330,6 +383,7 @@ impl WebSocketServer {
         data: &[u8],
         force_keyframe: &mut bool,
         pending_monitor_switch: &mut Option<u32>,
+        pending_encoding_settings: &mut Option<EncodingSettingsPayload>,
         input_injector: Option<&InputInjector>,
         active_monitor: ActiveMonitor,
     ) {
@@ -351,6 +405,13 @@ impl WebSocketServer {
             FrameType::MonitorSelect => {
                 if let Some(index) = Self::parse_monitor_index(data, header.payload_len) {
                     *pending_monitor_switch = Some(index);
+                }
+            }
+            FrameType::EncodingSettings => {
+                if let Some(payload) =
+                    Self::parse_json_payload::<EncodingSettingsPayload>(data, header.payload_len)
+                {
+                    *pending_encoding_settings = Some(payload);
                 }
             }
             FrameType::MouseInput => {
@@ -404,6 +465,47 @@ impl WebSocketServer {
         Self::parse_json_payload::<MonitorSelectPayload>(data, payload_len).map(|v| v.index)
     }
 
+    fn apply_encoding_settings(
+        payload: EncodingSettingsPayload,
+        encoding_settings: &mut EncodingSettings,
+        encoder: &mut Av1AmfEncoder,
+        width: u32,
+        height: u32,
+    ) -> bool {
+        let next_settings = EncodingSettings {
+            fps: payload.fps.clamp(MIN_TARGET_FPS, MAX_TARGET_FPS),
+            bitrate: (payload.bitrate as usize).clamp(MIN_TARGET_BITRATE, MAX_TARGET_BITRATE),
+            keyframe_interval_secs: payload
+                .keyframe_interval
+                .clamp(MIN_KEYFRAME_INTERVAL_SECS, MAX_KEYFRAME_INTERVAL_SECS),
+        };
+
+        if next_settings.fps == encoding_settings.fps
+            && next_settings.bitrate == encoding_settings.bitrate
+            && next_settings.keyframe_interval_secs == encoding_settings.keyframe_interval_secs
+        {
+            return false;
+        }
+
+        match Av1AmfEncoder::new(&Self::encoder_config(width, height, next_settings)) {
+            Ok(new_encoder) => {
+                *encoder = new_encoder;
+                *encoding_settings = next_settings;
+                log::info!(
+                    "编码设置已更新: {}fps, {}Mbps, 关键帧间隔 {}s",
+                    next_settings.fps,
+                    next_settings.bitrate / 1_000_000,
+                    next_settings.keyframe_interval_secs
+                );
+                true
+            }
+            Err(e) => {
+                log::warn!("更新编码设置失败: {}", e);
+                false
+            }
+        }
+    }
+
     fn parse_json_payload<T: DeserializeOwned>(data: &[u8], payload_len: u32) -> Option<T> {
         let start = FrameHeader::SIZE;
         let end = start.checked_add(payload_len as usize)?;
@@ -419,6 +521,7 @@ impl WebSocketServer {
         current_monitor_index: &mut u32,
         capturer: &mut DdaCapture,
         encoder: &mut Av1AmfEncoder,
+        encoding_settings: EncodingSettings,
     ) -> Result<bool, String> {
         if new_index == *current_monitor_index {
             return Ok(false);
@@ -436,6 +539,7 @@ impl WebSocketServer {
         let new_encoder = match Av1AmfEncoder::new(&Self::encoder_config(
             new_capturer.width(),
             new_capturer.height(),
+            encoding_settings,
         )) {
             Ok(e) => e,
             Err(e) => {
@@ -470,14 +574,23 @@ impl WebSocketServer {
             })
     }
 
-    fn encoder_config(width: u32, height: u32) -> EncoderConfig {
+    fn encoder_config(width: u32, height: u32, settings: EncodingSettings) -> EncoderConfig {
         EncoderConfig {
             width,
             height,
-            fps: TARGET_FPS,
-            bitrate: TARGET_BITRATE,
-            keyframe_interval: KEYFRAME_INTERVAL_SECS,
+            fps: settings.fps,
+            bitrate: settings.bitrate,
+            keyframe_interval: settings.keyframe_interval_secs,
         }
+    }
+
+    fn frame_interval_for_fps(fps: u32) -> Duration {
+        Duration::from_micros(1_000_000 / fps as u64)
+    }
+
+    fn capture_timeout_ms_for_fps(fps: u32) -> u32 {
+        // 向上取整并额外加 1ms，降低周期性超时概率
+        (1_000u32 + fps - 1) / fps + 1
     }
 
     fn build_video_packet(
@@ -505,14 +618,14 @@ impl WebSocketServer {
         packet
     }
 
-    fn pace_frame(frame_start: Instant) {
+    fn pace_frame(frame_start: Instant, frame_interval: Duration) {
         let elapsed = frame_start.elapsed();
-        if elapsed < FRAME_INTERVAL {
-            let sleep_duration = FRAME_INTERVAL - elapsed;
+        if elapsed < frame_interval {
+            let sleep_duration = frame_interval - elapsed;
             if sleep_duration > Duration::from_micros(500) {
                 std::thread::sleep(sleep_duration - Duration::from_micros(500));
             }
-            while frame_start.elapsed() < FRAME_INTERVAL {
+            while frame_start.elapsed() < frame_interval {
                 std::hint::spin_loop();
             }
         }

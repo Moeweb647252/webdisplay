@@ -28,6 +28,8 @@ pub enum FrameType {
     MouseInput = 0x06,
     /// 键盘输入 (客户端 → 服务端)
     KeyboardInput = 0x07,
+    /// 编码参数设置 (客户端 → 服务端)
+    EncodingSettings = 0x08,
     /// 心跳包
     Ping = 0x10,
     Pong = 0x11,
@@ -78,6 +80,7 @@ impl FrameHeader {
             0x05 => FrameType::MonitorSelect,
             0x06 => FrameType::MouseInput,
             0x07 => FrameType::KeyboardInput,
+            0x08 => FrameType::EncodingSettings,
             0x10 => FrameType::Ping,
             0x11 => FrameType::Pong,
             _ => return None,

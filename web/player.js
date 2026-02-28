@@ -10,6 +10,16 @@
 const HEADER_SIZE = 16;
 const SERVER_FPS = 60;
 const FRAME_TIMESTAMP_US = Math.round(1_000_000 / SERVER_FPS);
+const ENCODING_DEFAULTS = Object.freeze({
+    fps: 60,
+    bitrateMbps: 20,
+    keyframeInterval: 2,
+});
+const ENCODING_LIMITS = Object.freeze({
+    fps: { min: 24, max: 120 },
+    bitrateMbps: { min: 2, max: 80 },
+    keyframeInterval: { min: 1, max: 10 },
+});
 
 // 帧类型
 const FRAME_TYPE = {
@@ -20,6 +30,7 @@ const FRAME_TYPE = {
     MONITOR_SELECT: 0x05,
     MOUSE_INPUT: 0x06,
     KEYBOARD_INPUT: 0x07,
+    ENCODING_SETTINGS: 0x08,
     PING: 0x10,
     PONG: 0x11,
 };
@@ -38,6 +49,15 @@ class UltraLowLatencyPlayer {
         this.statusEl = document.getElementById('connection-status');
         this.monitorPicker = document.getElementById('monitor-picker');
         this.monitorListEl = document.getElementById('monitor-list');
+        this.encodingPanel = document.getElementById('encoding-panel');
+        this.encodingBitrateInput = document.getElementById('encoding-bitrate');
+        this.encodingFpsInput = document.getElementById('encoding-fps');
+        this.encodingKeyintInput = document.getElementById('encoding-keyint');
+        this.encodingBitrateValue = document.getElementById('encoding-bitrate-value');
+        this.encodingFpsValue = document.getElementById('encoding-fps-value');
+        this.encodingKeyintValue = document.getElementById('encoding-keyint-value');
+        this.encodingApplyBtn = document.getElementById('encoding-apply');
+        this.encodingResetBtn = document.getElementById('encoding-reset');
         this.controlHintEl = document.getElementById('control-hint');
         this.baseControlHint = this.controlHintEl ? this.controlHintEl.textContent : '';
 
@@ -76,6 +96,9 @@ class UltraLowLatencyPlayer {
         this.textDecoder = new TextDecoder();
         this.canvas.tabIndex = 0;
 
+        this.encodingSettings = { ...ENCODING_DEFAULTS };
+        this.encodingDraft = { ...this.encodingSettings };
+
         // 最新待渲染的帧（原子替换，旧帧自动丢弃）
         this.pendingFrame = null;
         this.renderBound = this._renderLoop.bind(this);
@@ -102,6 +125,8 @@ class UltraLowLatencyPlayer {
         }
 
         this._initDecoder();
+        this._bindEncodingEvents();
+        this._renderEncodingSettings();
         this._connect();
         requestAnimationFrame(this.renderBound);
         this._startStatsUpdate();
@@ -170,6 +195,7 @@ class UltraLowLatencyPlayer {
             this.connected = true;
             this.autoReconnect = true;
             this.statusEl.style.display = 'none';
+            this._syncEncodingSettings(false);
             // 连接后立即请求关键帧
             this._requestKeyframe();
         };
@@ -202,6 +228,136 @@ class UltraLowLatencyPlayer {
         this.ws.onerror = (e) => {
             console.error('WebSocket 错误:', e);
         };
+    }
+
+    _bindEncodingEvents() {
+        const onDraftChanged = () => {
+            this.encodingDraft = this._readEncodingSettingsFromInputs(this.encodingDraft);
+            this._renderEncodingSettings(this.encodingDraft);
+        };
+
+        if (this.encodingBitrateInput) {
+            this.encodingBitrateInput.addEventListener('input', onDraftChanged);
+        }
+        if (this.encodingFpsInput) {
+            this.encodingFpsInput.addEventListener('input', onDraftChanged);
+        }
+        if (this.encodingKeyintInput) {
+            this.encodingKeyintInput.addEventListener('input', onDraftChanged);
+        }
+        if (this.encodingApplyBtn) {
+            this.encodingApplyBtn.addEventListener('click', () => {
+                this._applyEncodingSettings();
+            });
+        }
+        if (this.encodingResetBtn) {
+            this.encodingResetBtn.addEventListener('click', () => {
+                this.encodingDraft = { ...ENCODING_DEFAULTS };
+                this._renderEncodingSettings(this.encodingDraft);
+                this._applyEncodingSettings();
+            });
+        }
+    }
+
+    _clampInt(rawValue, min, max, fallback) {
+        const value = Number.parseInt(rawValue, 10);
+        if (!Number.isFinite(value)) {
+            return fallback;
+        }
+        return Math.min(Math.max(value, min), max);
+    }
+
+    _readEncodingSettingsFromInputs(fallback = ENCODING_DEFAULTS) {
+        const bitrateRaw = this.encodingBitrateInput ? this.encodingBitrateInput.value : fallback.bitrateMbps;
+        const fpsRaw = this.encodingFpsInput ? this.encodingFpsInput.value : fallback.fps;
+        const keyintRaw = this.encodingKeyintInput ? this.encodingKeyintInput.value : fallback.keyframeInterval;
+
+        return {
+            bitrateMbps: this._clampInt(
+                bitrateRaw,
+                ENCODING_LIMITS.bitrateMbps.min,
+                ENCODING_LIMITS.bitrateMbps.max,
+                fallback.bitrateMbps,
+            ),
+            fps: this._clampInt(
+                fpsRaw,
+                ENCODING_LIMITS.fps.min,
+                ENCODING_LIMITS.fps.max,
+                fallback.fps,
+            ),
+            keyframeInterval: this._clampInt(
+                keyintRaw,
+                ENCODING_LIMITS.keyframeInterval.min,
+                ENCODING_LIMITS.keyframeInterval.max,
+                fallback.keyframeInterval,
+            ),
+        };
+    }
+
+    _renderEncodingSettings(settings = this.encodingDraft) {
+        if (this.encodingBitrateInput) {
+            this.encodingBitrateInput.value = `${settings.bitrateMbps}`;
+        }
+        if (this.encodingFpsInput) {
+            this.encodingFpsInput.value = `${settings.fps}`;
+        }
+        if (this.encodingKeyintInput) {
+            this.encodingKeyintInput.value = `${settings.keyframeInterval}`;
+        }
+        if (this.encodingBitrateValue) {
+            this.encodingBitrateValue.textContent = `${settings.bitrateMbps} Mbps`;
+        }
+        if (this.encodingFpsValue) {
+            this.encodingFpsValue.textContent = `${settings.fps} FPS`;
+        }
+        if (this.encodingKeyintValue) {
+            this.encodingKeyintValue.textContent = `${settings.keyframeInterval} 秒`;
+        }
+    }
+
+    _syncEncodingSettings(requestKeyframe = true) {
+        if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+            return false;
+        }
+
+        this._sendJsonControlPacket(FRAME_TYPE.ENCODING_SETTINGS, {
+            fps: this.encodingSettings.fps,
+            bitrate: this.encodingSettings.bitrateMbps * 1_000_000,
+            keyframe_interval: this.encodingSettings.keyframeInterval,
+        });
+
+        if (requestKeyframe) {
+            this._requestKeyframe();
+        }
+
+        return true;
+    }
+
+    _applyEncodingSettings() {
+        this.encodingDraft = this._readEncodingSettingsFromInputs(this.encodingDraft);
+        this.encodingSettings = { ...this.encodingDraft };
+        this._renderEncodingSettings(this.encodingDraft);
+
+        const syncOk = this._syncEncodingSettings(true);
+        if (syncOk) {
+            this._flashHint(`编码设置已应用: ${this.encodingSettings.fps}fps / ${this.encodingSettings.bitrateMbps}Mbps`);
+        } else {
+            this._flashHint('编码设置已保存，将在重连后自动应用');
+        }
+    }
+
+    _toggleEncodingPanel() {
+        if (!this.encodingPanel) {
+            return;
+        }
+
+        const willOpen = this.encodingPanel.classList.contains('hidden');
+        if (willOpen) {
+            this.encodingDraft = { ...this.encodingSettings };
+            this._renderEncodingSettings(this.encodingDraft);
+            this.monitorPicker.classList.add('hidden');
+        }
+        this.encodingPanel.classList.toggle('hidden');
     }
 
     _bindInputEvents() {
@@ -362,6 +518,8 @@ class UltraLowLatencyPlayer {
                 return 'stats';
             case 'KeyM':
                 return 'monitor';
+            case 'KeyE':
+                return 'encoding';
             case 'KeyL':
                 return 'lock';
             case 'KeyC':
@@ -412,7 +570,11 @@ class UltraLowLatencyPlayer {
                 this.overlay.classList.toggle('hidden');
                 break;
             case 'monitor':
+                this.encodingPanel.classList.add('hidden');
                 this.monitorPicker.classList.toggle('hidden');
+                break;
+            case 'encoding':
+                this._toggleEncodingPanel();
                 break;
             case 'lock':
                 this.lockPointerToVideo = !this.lockPointerToVideo;

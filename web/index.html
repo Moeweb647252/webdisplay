@@ -173,6 +173,103 @@
             margin-top: 16px;
         }
 
+        #encoding-panel {
+            position: fixed;
+            top: 12px;
+            right: 12px;
+            width: min(340px, calc(100vw - 24px));
+            background: rgba(20, 20, 20, 0.95);
+            padding: 18px;
+            border-radius: 12px;
+            z-index: 210;
+            backdrop-filter: blur(12px);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            box-shadow: 0 10px 30px rgba(0, 0, 0, 0.5);
+            transition: opacity 0.25s, transform 0.25s;
+        }
+
+        #encoding-panel.hidden {
+            opacity: 0;
+            pointer-events: none;
+            transform: translateY(-8px);
+        }
+
+        #encoding-panel h3 {
+            margin-bottom: 12px;
+            font-size: 17px;
+            font-weight: 500;
+            color: #fff;
+        }
+
+        .encoding-field {
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
+            margin-bottom: 12px;
+        }
+
+        .encoding-label {
+            display: flex;
+            justify-content: space-between;
+            align-items: baseline;
+            font-size: 13px;
+            color: #cfd8dc;
+        }
+
+        .encoding-label-value {
+            color: #4fc3f7;
+            font-family: 'Consolas', monospace;
+            font-size: 12px;
+        }
+
+        .encoding-field input[type="range"] {
+            width: 100%;
+            accent-color: #4fc3f7;
+        }
+
+        .encoding-field input[type="number"] {
+            width: 100%;
+            padding: 6px 8px;
+            border-radius: 6px;
+            border: 1px solid rgba(255, 255, 255, 0.18);
+            background: rgba(255, 255, 255, 0.08);
+            color: #fff;
+            font-size: 13px;
+        }
+
+        .encoding-actions {
+            display: flex;
+            gap: 8px;
+            margin-top: 14px;
+        }
+
+        .encoding-actions button {
+            flex: 1;
+            border: none;
+            border-radius: 6px;
+            padding: 8px 10px;
+            cursor: pointer;
+            font-size: 13px;
+            font-weight: 500;
+            transition: transform 0.15s ease, opacity 0.15s ease;
+        }
+
+        #encoding-apply {
+            background: #4fc3f7;
+            color: #001018;
+        }
+
+        #encoding-reset {
+            background: rgba(255, 255, 255, 0.08);
+            color: #d8d8d8;
+            border: 1px solid rgba(255, 255, 255, 0.2);
+        }
+
+        .encoding-actions button:hover {
+            opacity: 0.92;
+            transform: translateY(-1px);
+        }
+
         #control-hint {
             position: fixed;
             left: 50%;
@@ -235,7 +332,37 @@
         <div class="monitor-hint">Ctrl+Alt+Shift+M 切换显示面板</div>
     </div>
 
-    <div id="control-hint">Moonlight 快捷键: Ctrl+Alt+Shift+Z 接管/释放 · S 统计 · X 全屏 · M 显示器 · Q 断开/重连</div>
+    <div id="encoding-panel" class="hidden">
+        <h3>编码设置</h3>
+        <div class="encoding-field">
+            <div class="encoding-label">
+                <label for="encoding-bitrate">目标码率</label>
+                <span class="encoding-label-value" id="encoding-bitrate-value">20 Mbps</span>
+            </div>
+            <input id="encoding-bitrate" type="range" min="2" max="80" step="1" value="20">
+        </div>
+        <div class="encoding-field">
+            <div class="encoding-label">
+                <label for="encoding-fps">目标帧率</label>
+                <span class="encoding-label-value" id="encoding-fps-value">60 FPS</span>
+            </div>
+            <input id="encoding-fps" type="range" min="24" max="120" step="6" value="60">
+        </div>
+        <div class="encoding-field">
+            <div class="encoding-label">
+                <label for="encoding-keyint">关键帧间隔</label>
+                <span class="encoding-label-value" id="encoding-keyint-value">2 秒</span>
+            </div>
+            <input id="encoding-keyint" type="number" min="1" max="10" step="1" value="2">
+        </div>
+        <div class="encoding-actions">
+            <button id="encoding-apply" type="button">应用</button>
+            <button id="encoding-reset" type="button">默认</button>
+        </div>
+        <div class="monitor-hint">Ctrl+Alt+Shift+E 切换编码面板</div>
+    </div>
+
+    <div id="control-hint">Moonlight 快捷键: Ctrl+Alt+Shift+Z 接管/释放 · S 统计 · X 全屏 · M 显示器 · E 编码 · Q 断开/重连</div>
 
     <script src="player.js"></script>
 </body>
