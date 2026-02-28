@@ -12,16 +12,21 @@ const CODEC_PRESETS = Object.freeze([
     decoderCandidates: ['av01.0.08M.08'],
   },
   {
-    id: 'h265',
-    label: 'H.265 / HEVC',
+    id: 'hevc',
+    label: 'HEVC',
     decoderCandidates: ['hvc1.1.6.L93.B0', 'hev1.1.6.L93.B0'],
   },
   {
-    id: 'h264',
-    label: 'H.264 / AVC',
+    id: 'avc',
+    label: 'AVC',
     decoderCandidates: ['avc1.640028', 'avc1.4D401F', 'avc1.42E01E'],
   },
 ])
+
+const CODEC_ID_ALIASES = Object.freeze({
+  h264: 'avc',
+  h265: 'hevc',
+})
 
 const ENCODING_DEFAULTS = Object.freeze({
   codec: 'av1',
@@ -215,7 +220,7 @@ export class UltraLowLatencyPlayer {
       this._setConnectionState({
         visible: true,
         connected: false,
-        text: '❌ 浏览器不支持 AV1 / H.265 / H.264 硬件解码',
+        text: '❌ 浏览器不支持 AV1 / HEVC / AVC 硬件解码',
         detail: '',
       })
       return
@@ -444,7 +449,8 @@ export class UltraLowLatencyPlayer {
       return fallbackCodec
     }
 
-    const nextCodec = rawCodec.trim().toLowerCase()
+    const raw = rawCodec.trim().toLowerCase()
+    const nextCodec = CODEC_ID_ALIASES[raw] || raw
     if (this.supportedCodecConfigs.size === 0) {
       return CODEC_PRESETS.some((item) => item.id === nextCodec) ? nextCodec : fallbackCodec
     }

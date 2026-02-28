@@ -10,16 +10,16 @@ use std::time::Instant;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VideoCodec {
     Av1,
-    H264,
-    H265,
+    Avc,
+    Hevc,
 }
 
 impl VideoCodec {
     pub fn from_client_name(raw: &str) -> Option<Self> {
         match raw.trim().to_ascii_lowercase().as_str() {
             "av1" => Some(Self::Av1),
-            "h264" | "avc" => Some(Self::H264),
-            "h265" | "hevc" => Some(Self::H265),
+            "avc" | "h264" => Some(Self::Avc),
+            "hevc" | "h265" => Some(Self::Hevc),
             _ => None,
         }
     }
@@ -27,24 +27,24 @@ impl VideoCodec {
     pub fn as_client_name(self) -> &'static str {
         match self {
             Self::Av1 => "av1",
-            Self::H264 => "h264",
-            Self::H265 => "h265",
+            Self::Avc => "avc",
+            Self::Hevc => "hevc",
         }
     }
 
     pub fn display_name(self) -> &'static str {
         match self {
             Self::Av1 => "AV1",
-            Self::H264 => "H.264",
-            Self::H265 => "H.265/HEVC",
+            Self::Avc => "AVC",
+            Self::Hevc => "HEVC",
         }
     }
 
     fn ffmpeg_encoder_name(self) -> &'static str {
         match self {
             Self::Av1 => "av1_amf",
-            Self::H264 => "h264_amf",
-            Self::H265 => "hevc_amf",
+            Self::Avc => "h264_amf",
+            Self::Hevc => "hevc_amf",
         }
     }
 }
@@ -140,12 +140,12 @@ impl AmfEncoder {
                 opts.set("usage", "lowlatency");
                 opts.set("header_insertion_mode", "gop");
             }
-            VideoCodec::H264 => {
+            VideoCodec::Avc => {
                 opts.set("usage", "ultralowlatency");
                 opts.set("vbaq", "false");
                 opts.set("bf", "0");
             }
-            VideoCodec::H265 => {
+            VideoCodec::Hevc => {
                 opts.set("usage", "ultralowlatency");
                 opts.set("vbaq", "false");
                 opts.set("header_insertion_mode", "gop");
