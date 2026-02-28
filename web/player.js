@@ -135,8 +135,8 @@ class UltraLowLatencyPlayer {
      * 建立 WebSocket 连接
      */
     _connect() {
-        // 使用 WSS (WebSocket Secure)
-        const wsUrl = `wss://${location.hostname}:9001`;
+        const wsProtocol = location.protocol === 'https:' ? 'wss' : 'ws';
+        const wsUrl = `${wsProtocol}://${location.host}/ws`;
         console.log('连接到:', wsUrl);
 
         this.ws = new WebSocket(wsUrl);

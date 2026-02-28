@@ -65,23 +65,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 初始化 TLS
     let tls_config = server::tls::get_tls_config()?;
     let tls_acceptor = tokio_rustls::TlsAcceptor::from(tls_config);
-    let tls_acceptor_http = tls_acceptor.clone();
-    let tls_acceptor_ws = tls_acceptor.clone();
 
-    // 启动 WebSocket 服务器
-    let ws_server_clone = ws_server.clone();
-    let ws_addr: SocketAddr = "0.0.0.0:9001".parse()?;
+    // 启动统一 HTTP + WebSocket 服务器
+    let server_addr: SocketAddr = "0.0.0.0:8080".parse()?;
+    let ws_server_http = ws_server.clone();
     tokio::spawn(async move {
-        if let Err(e) = ws_server_clone.run(ws_addr, tls_acceptor_ws).await {
-            log::error!("WebSocket 服务器错误: {}", e);
-        }
-    });
-
-    // 启动 HTTP 静态文件服务器（提供 Web 页面）
-    let http_addr: SocketAddr = "0.0.0.0:8080".parse()?;
-    tokio::spawn(async move {
-        if let Err(e) = run_server(http_addr, tls_acceptor_http).await {
-            log::error!("HTTP 服务器错误: {}", e);
+        if let Err(e) = run_server(server_addr, tls_acceptor, ws_server_http).await {
+            log::error!("HTTP/WebSocket 服务器错误: {}", e);
         }
     });
 
@@ -99,7 +89,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     log::info!("服务已启动！");
     log::info!("  Web 界面: https://localhost:8080");
-    log::info!("  WebSocket: wss://localhost:9001");
+    log::info!("  WebSocket: wss://localhost:8080/ws");
 
     encode_handle.join().unwrap();
     Ok(())

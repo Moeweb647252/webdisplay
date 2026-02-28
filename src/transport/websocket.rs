@@ -1,10 +1,10 @@
 use crate::protocol::frame::{FrameFlags, FrameHeader, FrameType};
+use axum::extract::State;
+use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+use axum::response::IntoResponse;
 use futures_util::{SinkExt, StreamExt};
-use std::net::SocketAddr;
 use std::sync::Arc;
-use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::broadcast;
-use tokio_tungstenite::tungstenite::Message;
 
 /// WebSocket 串流服务器
 ///
@@ -46,63 +46,27 @@ impl WebSocketServer {
         )
     }
 
-    /// 启动 WebSocket 服务器
-    pub async fn run(
-        &self,
-        addr: SocketAddr,
-        acceptor: tokio_rustls::TlsAcceptor,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        let listener = TcpListener::bind(addr).await?;
-        log::info!("WebSocket 服务器监听: wss://{}", addr);
-
-        loop {
-            let (stream, peer_addr) = listener.accept().await?;
-            let acceptor = acceptor.clone();
-            log::info!("新客户端连接尝试: {}", peer_addr);
-
-            let frame_rx = self.frame_tx.subscribe();
-            let keyframe_tx = self.keyframe_request_tx.clone();
-            let monitor_switch_tx = self.monitor_switch_tx.clone();
-            let monitor_list = self.monitor_list_json.clone();
-
-            tokio::spawn(async move {
-                let _ = stream.set_nodelay(true);
-                let stream = match acceptor.accept(stream).await {
-                    Ok(s) => s,
-                    Err(e) => {
-                        log::error!("WS TLS handshake error from {}: {}", peer_addr, e);
-                        return;
-                    }
-                };
-                if let Err(e) = Self::handle_client(
-                    stream,
-                    frame_rx,
-                    keyframe_tx,
-                    monitor_switch_tx,
-                    monitor_list,
-                    peer_addr,
-                )
-                .await
-                {
-                    log::warn!("客户端 {} 断开: {}", peer_addr, e);
-                }
-            });
-        }
+    pub async fn websocket_upgrade(
+        State(server): State<Arc<WebSocketServer>>,
+        ws: WebSocketUpgrade,
+    ) -> impl IntoResponse {
+        ws.on_upgrade(move |socket| async move {
+            if let Err(e) = server.handle_client(socket).await {
+                log::warn!("客户端断开: {}", e);
+            }
+        })
     }
 
     /// 处理单个客户端连接
     async fn handle_client(
-        stream: tokio_rustls::server::TlsStream<TcpStream>,
-        mut frame_rx: broadcast::Receiver<Arc<Vec<u8>>>,
-        keyframe_tx: tokio::sync::mpsc::Sender<()>,
-        monitor_switch_tx: tokio::sync::mpsc::Sender<u32>,
-        monitor_list_json: Arc<Vec<u8>>,
-        peer_addr: SocketAddr,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        // 禁用 Nagle 算法已经在 acceptor.accept 前处理
-
-        let ws_stream = tokio_tungstenite::accept_async(stream).await?;
-        let (mut ws_sender, mut ws_receiver) = ws_stream.split();
+        &self,
+        socket: WebSocket,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let mut frame_rx = self.frame_tx.subscribe();
+        let keyframe_tx = self.keyframe_request_tx.clone();
+        let monitor_switch_tx = self.monitor_switch_tx.clone();
+        let monitor_list_json = self.monitor_list_json.clone();
+        let (mut ws_sender, mut ws_receiver) = socket.split();
 
         // 建立连接后立即发送显示器列表
         let header = FrameHeader {
@@ -123,21 +87,11 @@ impl WebSocketServer {
         // 发送任务：将编码帧推送给客户端
         let keyframe_tx1 = keyframe_tx.clone();
         let send_task = tokio::spawn(async move {
-            let mut _last_keyframe_data: Option<Arc<Vec<u8>>> = None;
-
             loop {
                 match frame_rx.recv().await {
                     Ok(frame_data) => {
-                        // 检查是否是关键帧（检查 header 标志位）
-                        if frame_data.len() >= FrameHeader::SIZE {
-                            let flags = FrameFlags::from_bits_truncate(frame_data[1]);
-                            if flags.contains(FrameFlags::KEYFRAME) {
-                                _last_keyframe_data = Some(frame_data.clone());
-                            }
-                        }
-
                         if ws_sender
-                            .send(Message::Binary(frame_data.to_vec().into()))
+                            .send(Message::Binary(frame_data.as_ref().clone().into()))
                             .await
                             .is_err()
                         {
@@ -146,7 +100,7 @@ impl WebSocketServer {
                     }
                     Err(broadcast::error::RecvError::Lagged(n)) => {
                         // 客户端落后，跳过旧帧
-                        log::warn!("客户端 {} 落后 {} 帧，跳过", peer_addr, n);
+                        log::warn!("客户端落后 {} 帧，跳过", n);
                         // 请求关键帧以便重新同步
                         let _ = keyframe_tx1.send(()).await;
                     }
@@ -161,11 +115,12 @@ impl WebSocketServer {
             while let Some(Ok(msg)) = ws_receiver.next().await {
                 if let Message::Binary(data) = msg {
                     if data.len() >= FrameHeader::SIZE {
-                        let header_bytes: [u8; FrameHeader::SIZE] =
-                            data[..FrameHeader::SIZE].try_into().unwrap();
+                        let Ok(header_bytes) = data[..FrameHeader::SIZE].try_into() else {
+                            continue;
+                        };
                         if let Some(header) = FrameHeader::from_bytes(&header_bytes) {
                             if header.frame_type == FrameType::KeyframeRequest {
-                                log::info!("客户端 {} 请求关键帧", peer_addr);
+                                log::info!("客户端请求关键帧");
                                 let _ = keyframe_tx2.send(()).await;
                             } else if header.frame_type == FrameType::MonitorSelect {
                                 let start = FrameHeader::SIZE;
@@ -178,11 +133,7 @@ impl WebSocketServer {
                                             if let Some(index) =
                                                 val.get("index").and_then(|v| v.as_u64())
                                             {
-                                                log::info!(
-                                                    "客户端 {} 请求切换屏幕到 {}",
-                                                    peer_addr,
-                                                    index
-                                                );
+                                                log::info!("客户端请求切换屏幕到 {}", index);
                                                 let _ = monitor_switch_tx.send(index as u32).await;
                                             }
                                         }
@@ -200,7 +151,7 @@ impl WebSocketServer {
             _ = recv_task => {}
         }
 
-        log::info!("客户端 {} 已断开", peer_addr);
+        log::info!("客户端已断开");
         Ok(())
     }
 
