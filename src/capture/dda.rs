@@ -12,6 +12,8 @@ pub struct DdaCapture {
     width: u32,
     height: u32,
     staging_texture: ID3D11Texture2D,
+    /// 系统屏幕旋转方向（从 DXGI_OUTDUPL_DESC 读取）
+    rotation: DXGI_MODE_ROTATION,
     cursor_shape: Option<CursorShape>,
     cursor_visible: bool,
     cursor_pos: POINT,
@@ -141,10 +143,18 @@ impl DdaCapture {
             // 创建 Desktop Duplication
             let duplication = output1.DuplicateOutput(&device)?;
 
-            // 预分配 staging 纹理（CPU 可读）
+            // 从 IDXGIOutputDuplication 描述中读取物理分辨率与屏幕旋转方向
+            // ModeDesc.Width/Height 是 GPU 扫描输出的硬件尺寸（未经旋转）
+            let dupl_desc = duplication.GetDesc();
+            let rotation = dupl_desc.Rotation;
+            // 若 ModeDesc 为零（系统内存模式），回退到逻辑尺寸
+            let phys_w = if dupl_desc.ModeDesc.Width > 0 { dupl_desc.ModeDesc.Width } else { width };
+            let phys_h = if dupl_desc.ModeDesc.Height > 0 { dupl_desc.ModeDesc.Height } else { height };
+
+            // 预分配 staging 纹理（CPU 可读），使用物理尺寸以匹配 DDA 纹理
             let staging_desc = D3D11_TEXTURE2D_DESC {
-                Width: width,
-                Height: height,
+                Width: phys_w,
+                Height: phys_h,
                 MipLevels: 1,
                 ArraySize: 1,
                 Format: DXGI_FORMAT_B8G8R8A8_UNORM,
@@ -162,7 +172,10 @@ impl DdaCapture {
             device.CreateTexture2D(&staging_desc, None, Some(&mut staging_texture))?;
             let staging_texture = staging_texture.unwrap();
 
-            log::info!("DDA 捕获器初始化完成: {}x{}, 格式: BGRA8", width, height);
+            log::info!(
+                "DDA 捕获器初始化完成: 逻辑 {}x{}, 物理 {}x{}, 旋转 {}, 格式: BGRA8",
+                width, height, phys_w, phys_h, rotation.0
+            );
 
             Ok(Self {
                 context,
@@ -170,6 +183,7 @@ impl DdaCapture {
                 width,
                 height,
                 staging_texture,
+                rotation,
                 cursor_shape: None,
                 cursor_visible: false,
                 cursor_pos: POINT::default(),
@@ -249,23 +263,27 @@ impl DdaCapture {
                 Some(&mut mapped),
             )?;
 
-            // 拷贝像素数据
-            let stride = mapped.RowPitch;
-            let data_size = (stride * self.height) as usize;
+            // 读取物理像素数据（staging 纹理尺寸为硬件物理分辨率）
+            let (phys_w, phys_h) = self.phys_dims();
+            let src_stride = mapped.RowPitch;
+            let data_size = (src_stride * phys_h) as usize;
             let src_slice = std::slice::from_raw_parts(mapped.pData as *const u8, data_size);
-            let mut data = src_slice.to_vec();
+
+            // 旋转到逻辑屏幕方向（与系统显示设置一致）
+            let (mut data, out_w, out_h, out_stride) =
+                rotate_frame(src_slice, src_stride, phys_w, phys_h, self.rotation);
 
             self.context.Unmap(&self.staging_texture, 0);
             self.duplication.ReleaseFrame()?;
 
-            // 将光标叠加混合到帧数据上
+            // 将光标叠加混合到帧数据上（已处于逻辑坐标系）
             if self.cursor_visible {
                 if let Some(ref shape) = self.cursor_shape {
                     draw_cursor_on_frame(
                         &mut data,
-                        stride,
-                        self.width,
-                        self.height,
+                        out_stride,
+                        out_w,
+                        out_h,
                         self.cursor_pos,
                         &shape.info,
                         &shape.buffer,
@@ -273,7 +291,18 @@ impl DdaCapture {
                 }
             }
 
-            Ok(Some(CapturedFrame { data, stride }))
+            Ok(Some(CapturedFrame { data, stride: out_stride }))
+        }
+    }
+
+    /// 返回物理扫描输出尺寸（旋转 90°/270° 时宽高互换）
+    fn phys_dims(&self) -> (u32, u32) {
+        if self.rotation == DXGI_MODE_ROTATION_ROTATE90
+            || self.rotation == DXGI_MODE_ROTATION_ROTATE270
+        {
+            (self.height, self.width) // phys_w = logical_h, phys_h = logical_w
+        } else {
+            (self.width, self.height)
         }
     }
 
@@ -283,6 +312,76 @@ impl DdaCapture {
 
     pub fn height(&self) -> u32 {
         self.height
+    }
+}
+
+/// 将物理扫描缓冲旋转到逻辑屏幕方向（BGRA8，行步长对齐去除）
+///
+/// 返回 `(像素数据, 逻辑宽, 逻辑高, 逻辑行步长)`。
+/// - `IDENTITY` / `UNSPECIFIED`：去除 GPU 行填充，紧凑输出
+/// - `ROTATE90`：顺时针 90°，src(x,y) → dst(H−1−y, x)
+/// - `ROTATE180`：src(x,y) → dst(W−1−x, H−1−y)
+/// - `ROTATE270`：顺时针 270°（逆时针 90°），src(x,y) → dst(y, W−1−x)
+fn rotate_frame(
+    src: &[u8],
+    src_stride: u32,
+    phys_w: u32,
+    phys_h: u32,
+    rotation: DXGI_MODE_ROTATION,
+) -> (Vec<u8>, u32, u32, u32) {
+    if rotation == DXGI_MODE_ROTATION_ROTATE90 {
+        // dst 尺寸：宽 = phys_h，高 = phys_w
+        let (dst_w, dst_h) = (phys_h, phys_w);
+        let dst_stride = dst_w * 4;
+        let mut dst = vec![0u8; (dst_stride * dst_h) as usize];
+        for src_y in 0..phys_h {
+            for src_x in 0..phys_w {
+                let src_off = src_y as usize * src_stride as usize + src_x as usize * 4;
+                let dst_x = phys_h - 1 - src_y;
+                let dst_y = src_x;
+                let dst_off = dst_y as usize * dst_stride as usize + dst_x as usize * 4;
+                dst[dst_off..dst_off + 4].copy_from_slice(&src[src_off..src_off + 4]);
+            }
+        }
+        (dst, dst_w, dst_h, dst_stride)
+    } else if rotation == DXGI_MODE_ROTATION_ROTATE180 {
+        let dst_stride = phys_w * 4;
+        let mut dst = vec![0u8; (dst_stride * phys_h) as usize];
+        for src_y in 0..phys_h {
+            for src_x in 0..phys_w {
+                let src_off = src_y as usize * src_stride as usize + src_x as usize * 4;
+                let dst_x = phys_w - 1 - src_x;
+                let dst_y = phys_h - 1 - src_y;
+                let dst_off = dst_y as usize * dst_stride as usize + dst_x as usize * 4;
+                dst[dst_off..dst_off + 4].copy_from_slice(&src[src_off..src_off + 4]);
+            }
+        }
+        (dst, phys_w, phys_h, dst_stride)
+    } else if rotation == DXGI_MODE_ROTATION_ROTATE270 {
+        // dst 尺寸：宽 = phys_h，高 = phys_w
+        let (dst_w, dst_h) = (phys_h, phys_w);
+        let dst_stride = dst_w * 4;
+        let mut dst = vec![0u8; (dst_stride * dst_h) as usize];
+        for src_y in 0..phys_h {
+            for src_x in 0..phys_w {
+                let src_off = src_y as usize * src_stride as usize + src_x as usize * 4;
+                let dst_x = src_y;
+                let dst_y = phys_w - 1 - src_x;
+                let dst_off = dst_y as usize * dst_stride as usize + dst_x as usize * 4;
+                dst[dst_off..dst_off + 4].copy_from_slice(&src[src_off..src_off + 4]);
+            }
+        }
+        (dst, dst_w, dst_h, dst_stride)
+    } else {
+        // IDENTITY / UNSPECIFIED：去除 GPU 行填充，输出紧凑行步长
+        let dst_stride = phys_w * 4;
+        let mut dst = vec![0u8; (dst_stride * phys_h) as usize];
+        for row in 0..phys_h as usize {
+            let src_row_start = row * src_stride as usize;
+            dst[row * dst_stride as usize..(row + 1) * dst_stride as usize]
+                .copy_from_slice(&src[src_row_start..src_row_start + dst_stride as usize]);
+        }
+        (dst, phys_w, phys_h, dst_stride)
     }
 }
 
