@@ -1,19 +1,128 @@
+use std::ffi::c_void;
+
 use windows::Win32::Foundation::POINT;
+use windows::Win32::Graphics::Direct3D::Fxc::{
+    D3DCOMPILE_ENABLE_STRICTNESS, D3DCOMPILE_OPTIMIZATION_LEVEL3, D3DCompile,
+};
 use windows::Win32::Graphics::Direct3D::*;
 use windows::Win32::Graphics::Direct3D11::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::Win32::Graphics::Dxgi::*;
-use windows::core::Interface;
+use windows::core::{Interface, PCSTR};
+
+const ROTATION_IDENTITY: u32 = 0;
+const ROTATION_90: u32 = 1;
+const ROTATION_180: u32 = 2;
+const ROTATION_270: u32 = 3;
+
+const CURSOR_TYPE_NONE: u32 = 0;
+const CURSOR_TYPE_COLOR: u32 = 1;
+const CURSOR_TYPE_MASKED_COLOR: u32 = 2;
+const CURSOR_TYPE_MONOCHROME: u32 = 3;
+
+const COMPOSITE_SHADER: &str = r#"
+cbuffer CompositeCB : register(b0) {
+    uint4 src_info;
+    int4 cursor_rect;
+    uint4 cursor_info;
+};
+
+Texture2D<float4> frame_tex : register(t0);
+Texture2D<float4> cursor_color_tex : register(t1);
+Texture2D<uint> cursor_mono_tex : register(t2);
+
+struct VsOut {
+    float4 position : SV_POSITION;
+};
+
+VsOut vs_main(uint vertex_id : SV_VertexID) {
+    float2 pos = float2(-1.0, -1.0);
+    if (vertex_id == 1) {
+        pos = float2(-1.0, 3.0);
+    } else if (vertex_id == 2) {
+        pos = float2(3.0, -1.0);
+    }
+
+    VsOut outv;
+    outv.position = float4(pos, 0.0, 1.0);
+    return outv;
+}
+
+float4 ps_main(VsOut input) : SV_TARGET {
+    int2 dst = int2(input.position.xy);
+    int src_w = (int)src_info.x;
+    int src_h = (int)src_info.y;
+    int rotation = (int)src_info.z;
+
+    int2 src = dst;
+    if (rotation == 1) {
+        src = int2(dst.y, src_h - 1 - dst.x);
+    } else if (rotation == 2) {
+        src = int2(src_w - 1 - dst.x, src_h - 1 - dst.y);
+    } else if (rotation == 3) {
+        src = int2(src_w - 1 - dst.y, dst.x);
+    }
+
+    float4 base = frame_tex.Load(int3(src, 0));
+    base.a = 1.0;
+
+    if (src_info.w != 0u) {
+        int cx = dst.x - cursor_rect.x;
+        int cy = dst.y - cursor_rect.y;
+        if (cx >= 0 && cy >= 0 && cx < cursor_rect.z && cy < cursor_rect.w) {
+            uint cursor_type = cursor_info.x;
+            if (cursor_type == 1u) {
+                float4 c = cursor_color_tex.Load(int3(cx, cy, 0));
+                float a = saturate(c.a);
+                base.rgb = c.rgb * a + base.rgb * (1.0 - a);
+            } else if (cursor_type == 2u) {
+                float4 c = cursor_color_tex.Load(int3(cx, cy, 0));
+                uint ca = (uint)round(saturate(c.a) * 255.0);
+                if (ca == 255u) {
+                    uint3 src_u8 = uint3(round(saturate(base.rgb) * 255.0));
+                    uint3 mask_u8 = uint3(round(saturate(c.rgb) * 255.0));
+                    src_u8 = src_u8 ^ mask_u8;
+                    base.rgb = float3(src_u8) / 255.0;
+                } else if (ca != 0u) {
+                    float a = (float)ca / 255.0;
+                    base.rgb = c.rgb * a + base.rgb * (1.0 - a);
+                }
+            } else if (cursor_type == 3u) {
+                uint op = cursor_mono_tex.Load(int3(cx, cy, 0));
+                if (op == 0u) {
+                    base.rgb = float3(0.0, 0.0, 0.0);
+                } else if (op == 2u) {
+                    base.rgb = float3(1.0, 1.0, 1.0);
+                } else if (op == 3u) {
+                    base.rgb = 1.0 - base.rgb;
+                }
+            }
+        }
+    }
+
+    return base;
+}
+"#;
 
 /// DDA 捕获器 —— 通过 DXGI Output Duplication 实现零拷贝屏幕捕获
 pub struct DdaCapture {
+    device: ID3D11Device,
     context: ID3D11DeviceContext,
     duplication: IDXGIOutputDuplication,
     width: u32,
     height: u32,
+    phys_width: u32,
+    phys_height: u32,
+    shader_rotation: u32,
+    frame_texture: ID3D11Texture2D,
+    frame_srv: ID3D11ShaderResourceView,
+    composed_texture: ID3D11Texture2D,
+    composed_rtv: ID3D11RenderTargetView,
     staging_texture: ID3D11Texture2D,
-    /// 系统屏幕旋转方向（从 DXGI_OUTDUPL_DESC 读取）
-    rotation: DXGI_MODE_ROTATION,
+    vertex_shader: ID3D11VertexShader,
+    pixel_shader: ID3D11PixelShader,
+    constant_buffer: ID3D11Buffer,
+    viewport: D3D11_VIEWPORT,
     cursor_shape: Option<CursorShape>,
     cursor_visible: bool,
     cursor_pos: POINT,
@@ -34,10 +143,25 @@ pub struct CapturedFrame {
     pub stride: u32,
 }
 
-/// 缓存的光标形状数据
 struct CursorShape {
     info: DXGI_OUTDUPL_POINTER_SHAPE_INFO,
-    buffer: Vec<u8>,
+    width: u32,
+    height: u32,
+    texture: CursorTexture,
+}
+
+enum CursorTexture {
+    Color(ID3D11ShaderResourceView),
+    MaskedColor(ID3D11ShaderResourceView),
+    Monochrome(ID3D11ShaderResourceView),
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct CompositeConstants {
+    src_info: [u32; 4],
+    cursor_rect: [i32; 4],
+    cursor_info: [u32; 4],
 }
 
 impl DdaCapture {
@@ -45,7 +169,6 @@ impl DdaCapture {
     pub fn enumerate_monitors() -> Result<Vec<MonitorInfo>, Box<dyn std::error::Error>> {
         let mut monitors = Vec::new();
         unsafe {
-            // 创建一个用于枚举的临时设备
             let mut device = None;
             let feature_levels = [D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0];
 
@@ -79,7 +202,6 @@ impl DdaCapture {
                         let primary =
                             desc.DesktopCoordinates.left == 0 && desc.DesktopCoordinates.top == 0;
 
-                        // Parse utf-16 device name
                         let name_len = desc
                             .DeviceName
                             .iter()
@@ -103,13 +225,8 @@ impl DdaCapture {
     }
 
     /// 初始化 DDA 捕获
-    ///
-    /// 延迟关键设计：
-    /// - 使用 D3D11_CREATE_DEVICE_VIDEO_SUPPORT 标志以获得硬件加速支持
-    /// - Staging 纹理预分配，避免运行时内存分配
     pub fn new(monitor_index: u32) -> Result<Self, Box<dyn std::error::Error>> {
         unsafe {
-            // 创建 D3D11 设备
             let mut device = None;
             let mut context = None;
             let feature_levels = [D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0];
@@ -129,32 +246,82 @@ impl DdaCapture {
             let device = device.unwrap();
             let context = context.unwrap();
 
-            // 获取 DXGI 适配器和输出
             let dxgi_device: IDXGIDevice = device.cast()?;
             let adapter = dxgi_device.GetAdapter()?;
             let output: IDXGIOutput = adapter.EnumOutputs(monitor_index)?;
             let output1: IDXGIOutput1 = output.cast()?;
 
-            // 获取输出描述以得到分辨率
             let desc = output.GetDesc()?;
             let width = (desc.DesktopCoordinates.right - desc.DesktopCoordinates.left) as u32;
             let height = (desc.DesktopCoordinates.bottom - desc.DesktopCoordinates.top) as u32;
 
-            // 创建 Desktop Duplication
             let duplication = output1.DuplicateOutput(&device)?;
-
-            // 从 IDXGIOutputDuplication 描述中读取物理分辨率与屏幕旋转方向
-            // ModeDesc.Width/Height 是 GPU 扫描输出的硬件尺寸（未经旋转）
             let dupl_desc = duplication.GetDesc();
             let rotation = dupl_desc.Rotation;
-            // 若 ModeDesc 为零（系统内存模式），回退到逻辑尺寸
-            let phys_w = if dupl_desc.ModeDesc.Width > 0 { dupl_desc.ModeDesc.Width } else { width };
-            let phys_h = if dupl_desc.ModeDesc.Height > 0 { dupl_desc.ModeDesc.Height } else { height };
 
-            // 预分配 staging 纹理（CPU 可读），使用物理尺寸以匹配 DDA 纹理
+            let (phys_width, phys_height) =
+                if dupl_desc.ModeDesc.Width > 0 && dupl_desc.ModeDesc.Height > 0 {
+                    (dupl_desc.ModeDesc.Width, dupl_desc.ModeDesc.Height)
+                } else if rotation == DXGI_MODE_ROTATION_ROTATE90
+                    || rotation == DXGI_MODE_ROTATION_ROTATE270
+                {
+                    (height, width)
+                } else {
+                    (width, height)
+                };
+            let shader_rotation = to_shader_rotation(rotation);
+
+            let frame_desc = D3D11_TEXTURE2D_DESC {
+                Width: phys_width,
+                Height: phys_height,
+                MipLevels: 1,
+                ArraySize: 1,
+                Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
+                Usage: D3D11_USAGE_DEFAULT,
+                BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
+                CPUAccessFlags: 0,
+                MiscFlags: 0,
+            };
+
+            let mut frame_texture = None;
+            device.CreateTexture2D(&frame_desc, None, Some(&mut frame_texture))?;
+            let frame_texture = frame_texture.unwrap();
+
+            let mut frame_srv = None;
+            device.CreateShaderResourceView(&frame_texture, None, Some(&mut frame_srv))?;
+            let frame_srv = frame_srv.unwrap();
+
+            let composed_desc = D3D11_TEXTURE2D_DESC {
+                Width: width,
+                Height: height,
+                MipLevels: 1,
+                ArraySize: 1,
+                Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
+                Usage: D3D11_USAGE_DEFAULT,
+                BindFlags: D3D11_BIND_RENDER_TARGET.0 as u32,
+                CPUAccessFlags: 0,
+                MiscFlags: 0,
+            };
+
+            let mut composed_texture = None;
+            device.CreateTexture2D(&composed_desc, None, Some(&mut composed_texture))?;
+            let composed_texture = composed_texture.unwrap();
+
+            let mut composed_rtv = None;
+            device.CreateRenderTargetView(&composed_texture, None, Some(&mut composed_rtv))?;
+            let composed_rtv = composed_rtv.unwrap();
+
             let staging_desc = D3D11_TEXTURE2D_DESC {
-                Width: phys_w,
-                Height: phys_h,
+                Width: width,
+                Height: height,
                 MipLevels: 1,
                 ArraySize: 1,
                 Format: DXGI_FORMAT_B8G8R8A8_UNORM,
@@ -172,18 +339,65 @@ impl DdaCapture {
             device.CreateTexture2D(&staging_desc, None, Some(&mut staging_texture))?;
             let staging_texture = staging_texture.unwrap();
 
+            let vs_blob = compile_shader_blob(COMPOSITE_SHADER, b"vs_main\0", b"vs_5_0\0")?;
+            let ps_blob = compile_shader_blob(COMPOSITE_SHADER, b"ps_main\0", b"ps_5_0\0")?;
+
+            let mut vertex_shader = None;
+            device.CreateVertexShader(blob_bytes(&vs_blob), None, Some(&mut vertex_shader))?;
+            let vertex_shader = vertex_shader.unwrap();
+
+            let mut pixel_shader = None;
+            device.CreatePixelShader(blob_bytes(&ps_blob), None, Some(&mut pixel_shader))?;
+            let pixel_shader = pixel_shader.unwrap();
+
+            let constant_desc = D3D11_BUFFER_DESC {
+                ByteWidth: std::mem::size_of::<CompositeConstants>() as u32,
+                Usage: D3D11_USAGE_DEFAULT,
+                BindFlags: D3D11_BIND_CONSTANT_BUFFER.0 as u32,
+                CPUAccessFlags: 0,
+                MiscFlags: 0,
+                StructureByteStride: 0,
+            };
+            let mut constant_buffer = None;
+            device.CreateBuffer(&constant_desc, None, Some(&mut constant_buffer))?;
+            let constant_buffer = constant_buffer.unwrap();
+
+            let viewport = D3D11_VIEWPORT {
+                TopLeftX: 0.0,
+                TopLeftY: 0.0,
+                Width: width as f32,
+                Height: height as f32,
+                MinDepth: 0.0,
+                MaxDepth: 1.0,
+            };
+
             log::info!(
-                "DDA 捕获器初始化完成: 逻辑 {}x{}, 物理 {}x{}, 旋转 {}, 格式: BGRA8",
-                width, height, phys_w, phys_h, rotation.0
+                "DDA 捕获器初始化完成: 逻辑 {}x{}, 物理 {}x{}, 旋转 {}, GPU 合成启用",
+                width,
+                height,
+                phys_width,
+                phys_height,
+                rotation.0
             );
 
             Ok(Self {
+                device,
                 context,
                 duplication,
                 width,
                 height,
+                phys_width,
+                phys_height,
+                shader_rotation,
+                frame_texture,
+                frame_srv,
+                composed_texture,
+                composed_rtv,
                 staging_texture,
-                rotation,
+                vertex_shader,
+                pixel_shader,
+                constant_buffer,
+                viewport,
                 cursor_shape: None,
                 cursor_visible: false,
                 cursor_pos: POINT::default(),
@@ -192,11 +406,6 @@ impl DdaCapture {
     }
 
     /// 捕获一帧
-    ///
-    /// 超时时间设为 0ms 实现非阻塞轮询，
-    /// 或设为较短时间如 16ms（一帧时间）以降低 CPU 占用。
-    ///
-    /// 帧获取时间复杂度: $O(1)$ GPU 拷贝 + $O(W \times H)$ CPU 映射
     pub fn capture_frame(
         &mut self,
         timeout_ms: u32,
@@ -205,104 +414,71 @@ impl DdaCapture {
             let mut frame_info = DXGI_OUTDUPL_FRAME_INFO::default();
             let mut resource = None;
 
-            // 尝试获取下一帧
             match self
                 .duplication
                 .AcquireNextFrame(timeout_ms, &mut frame_info, &mut resource)
             {
                 Ok(()) => {}
                 Err(e) if e.code().0 as u32 == 0x887A0027 => {
-                    // DXGI_ERROR_WAIT_TIMEOUT
                     return Ok(None);
                 }
                 Err(e) => return Err(e.into()),
             }
 
-            // 更新光标形状（仅当形状发生变化时）
             if frame_info.PointerShapeBufferSize > 0 {
-                let buf_size = frame_info.PointerShapeBufferSize;
-                let mut shape_buffer = vec![0u8; buf_size as usize];
-                let mut shape_info = DXGI_OUTDUPL_POINTER_SHAPE_INFO::default();
-                let mut size_needed = 0u32;
-                if self
-                    .duplication
-                    .GetFramePointerShape(
-                        buf_size,
-                        shape_buffer.as_mut_ptr() as *mut _,
-                        &mut size_needed,
-                        &mut shape_info,
-                    )
-                    .is_ok()
-                {
-                    self.cursor_shape = Some(CursorShape {
-                        info: shape_info,
-                        buffer: shape_buffer,
-                    });
-                }
+                self.update_cursor_shape(frame_info.PointerShapeBufferSize)?;
             }
 
-            // 更新光标位置（仅当鼠标状态发生变化时）
             if frame_info.LastMouseUpdateTime != 0 {
                 self.cursor_visible = frame_info.PointerPosition.Visible.as_bool();
                 self.cursor_pos = frame_info.PointerPosition.Position;
             }
 
-            let resource = resource.unwrap();
-            let texture: ID3D11Texture2D = resource.cast()?;
+            let result = (|| -> Result<CapturedFrame, Box<dyn std::error::Error>> {
+                let resource = resource.ok_or("AcquireNextFrame 未返回帧资源")?;
+                let texture: ID3D11Texture2D = resource.cast()?;
 
-            // GPU → Staging 拷贝（GPU 内部操作，非常快）
-            self.context.CopyResource(&self.staging_texture, &texture);
+                self.context.CopyResource(&self.frame_texture, &texture);
+                self.render_composite()?;
+                self.context
+                    .CopyResource(&self.staging_texture, &self.composed_texture);
 
-            // 映射 staging 纹理到 CPU 内存
-            let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
-            self.context.Map(
-                &self.staging_texture,
-                0,
-                D3D11_MAP_READ,
-                0,
-                Some(&mut mapped),
-            )?;
+                let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+                self.context.Map(
+                    &self.staging_texture,
+                    0,
+                    D3D11_MAP_READ,
+                    0,
+                    Some(&mut mapped),
+                )?;
 
-            // 读取物理像素数据（staging 纹理尺寸为硬件物理分辨率）
-            let (phys_w, phys_h) = self.phys_dims();
-            let src_stride = mapped.RowPitch;
-            let data_size = (src_stride * phys_h) as usize;
-            let src_slice = std::slice::from_raw_parts(mapped.pData as *const u8, data_size);
+                let row_bytes = (self.width * 4) as usize;
+                let src_stride = mapped.RowPitch as usize;
+                let src_size = src_stride * self.height as usize;
+                let src = std::slice::from_raw_parts(mapped.pData as *const u8, src_size);
 
-            // 旋转到逻辑屏幕方向（与系统显示设置一致）
-            let (mut data, out_w, out_h, out_stride) =
-                rotate_frame(src_slice, src_stride, phys_w, phys_h, self.rotation);
+                let mut data = vec![0u8; row_bytes * self.height as usize];
+                for row in 0..self.height as usize {
+                    let src_start = row * src_stride;
+                    let dst_start = row * row_bytes;
+                    data[dst_start..dst_start + row_bytes]
+                        .copy_from_slice(&src[src_start..src_start + row_bytes]);
+                }
 
-            self.context.Unmap(&self.staging_texture, 0);
+                self.context.Unmap(&self.staging_texture, 0);
+
+                Ok(CapturedFrame {
+                    data,
+                    stride: self.width * 4,
+                })
+            })();
+
             self.duplication.ReleaseFrame()?;
 
-            // 将光标叠加混合到帧数据上（已处于逻辑坐标系）
-            if self.cursor_visible {
-                if let Some(ref shape) = self.cursor_shape {
-                    draw_cursor_on_frame(
-                        &mut data,
-                        out_stride,
-                        out_w,
-                        out_h,
-                        self.cursor_pos,
-                        &shape.info,
-                        &shape.buffer,
-                    );
-                }
+            match result {
+                Ok(frame) => Ok(Some(frame)),
+                Err(e) => Err(e),
             }
-
-            Ok(Some(CapturedFrame { data, stride: out_stride }))
-        }
-    }
-
-    /// 返回物理扫描输出尺寸（旋转 90°/270° 时宽高互换）
-    fn phys_dims(&self) -> (u32, u32) {
-        if self.rotation == DXGI_MODE_ROTATION_ROTATE90
-            || self.rotation == DXGI_MODE_ROTATION_ROTATE270
-        {
-            (self.height, self.width) // phys_w = logical_h, phys_h = logical_w
-        } else {
-            (self.width, self.height)
         }
     }
 
@@ -313,232 +489,314 @@ impl DdaCapture {
     pub fn height(&self) -> u32 {
         self.height
     }
-}
 
-/// 将物理扫描缓冲旋转到逻辑屏幕方向（BGRA8，行步长对齐去除）
-///
-/// 返回 `(像素数据, 逻辑宽, 逻辑高, 逻辑行步长)`。
-/// - `IDENTITY` / `UNSPECIFIED`：去除 GPU 行填充，紧凑输出
-/// - `ROTATE90`：顺时针 90°，src(x,y) → dst(H−1−y, x)
-/// - `ROTATE180`：src(x,y) → dst(W−1−x, H−1−y)
-/// - `ROTATE270`：顺时针 270°（逆时针 90°），src(x,y) → dst(y, W−1−x)
-fn rotate_frame(
-    src: &[u8],
-    src_stride: u32,
-    phys_w: u32,
-    phys_h: u32,
-    rotation: DXGI_MODE_ROTATION,
-) -> (Vec<u8>, u32, u32, u32) {
-    if rotation == DXGI_MODE_ROTATION_ROTATE90 {
-        // dst 尺寸：宽 = phys_h，高 = phys_w
-        let (dst_w, dst_h) = (phys_h, phys_w);
-        let dst_stride = dst_w * 4;
-        let mut dst = vec![0u8; (dst_stride * dst_h) as usize];
-        for src_y in 0..phys_h {
-            for src_x in 0..phys_w {
-                let src_off = src_y as usize * src_stride as usize + src_x as usize * 4;
-                let dst_x = phys_h - 1 - src_y;
-                let dst_y = src_x;
-                let dst_off = dst_y as usize * dst_stride as usize + dst_x as usize * 4;
-                dst[dst_off..dst_off + 4].copy_from_slice(&src[src_off..src_off + 4]);
+    fn update_cursor_shape(
+        &mut self,
+        shape_buffer_size: u32,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        unsafe {
+            let mut shape_buffer = vec![0u8; shape_buffer_size as usize];
+            let mut shape_info = DXGI_OUTDUPL_POINTER_SHAPE_INFO::default();
+            let mut size_needed = 0u32;
+
+            self.duplication.GetFramePointerShape(
+                shape_buffer_size,
+                shape_buffer.as_mut_ptr() as *mut _,
+                &mut size_needed,
+                &mut shape_info,
+            )?;
+
+            match create_cursor_shape(&self.device, shape_info, &shape_buffer) {
+                Ok(shape) => {
+                    self.cursor_shape = Some(shape);
+                }
+                Err(e) => {
+                    self.cursor_shape = None;
+                    log::warn!("创建 GPU 光标纹理失败: {}", e);
+                }
             }
+
+            Ok(())
         }
-        (dst, dst_w, dst_h, dst_stride)
-    } else if rotation == DXGI_MODE_ROTATION_ROTATE180 {
-        let dst_stride = phys_w * 4;
-        let mut dst = vec![0u8; (dst_stride * phys_h) as usize];
-        for src_y in 0..phys_h {
-            for src_x in 0..phys_w {
-                let src_off = src_y as usize * src_stride as usize + src_x as usize * 4;
-                let dst_x = phys_w - 1 - src_x;
-                let dst_y = phys_h - 1 - src_y;
-                let dst_off = dst_y as usize * dst_stride as usize + dst_x as usize * 4;
-                dst[dst_off..dst_off + 4].copy_from_slice(&src[src_off..src_off + 4]);
+    }
+
+    fn render_composite(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        unsafe {
+            let mut constants = CompositeConstants {
+                src_info: [
+                    self.phys_width,
+                    self.phys_height,
+                    self.shader_rotation,
+                    CURSOR_TYPE_NONE,
+                ],
+                ..Default::default()
+            };
+
+            let mut color_srv = None;
+            let mut mono_srv = None;
+
+            if self.cursor_visible {
+                if let Some(shape) = &self.cursor_shape {
+                    constants.src_info[3] = 1;
+                    constants.cursor_rect = [
+                        self.cursor_pos.x - shape.info.HotSpot.x,
+                        self.cursor_pos.y - shape.info.HotSpot.y,
+                        shape.width as i32,
+                        shape.height as i32,
+                    ];
+
+                    match &shape.texture {
+                        CursorTexture::Color(srv) => {
+                            constants.cursor_info[0] = CURSOR_TYPE_COLOR;
+                            color_srv = Some(srv.clone());
+                        }
+                        CursorTexture::MaskedColor(srv) => {
+                            constants.cursor_info[0] = CURSOR_TYPE_MASKED_COLOR;
+                            color_srv = Some(srv.clone());
+                        }
+                        CursorTexture::Monochrome(srv) => {
+                            constants.cursor_info[0] = CURSOR_TYPE_MONOCHROME;
+                            mono_srv = Some(srv.clone());
+                        }
+                    }
+                }
             }
+
+            self.context.UpdateSubresource(
+                &self.constant_buffer,
+                0,
+                None,
+                &constants as *const _ as *const c_void,
+                0,
+                0,
+            );
+
+            self.context.IASetInputLayout(None::<&ID3D11InputLayout>);
+            self.context
+                .IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            self.context.RSSetViewports(Some(&[self.viewport]));
+            self.context.VSSetShader(&self.vertex_shader, None);
+            self.context.PSSetShader(&self.pixel_shader, None);
+
+            let constant_buffers = [Some(self.constant_buffer.clone())];
+            self.context
+                .PSSetConstantBuffers(0, Some(&constant_buffers));
+
+            let render_targets = [Some(self.composed_rtv.clone())];
+            self.context
+                .OMSetRenderTargets(Some(&render_targets), None::<&ID3D11DepthStencilView>);
+
+            let shader_resources = [Some(self.frame_srv.clone()), color_srv, mono_srv];
+            self.context
+                .PSSetShaderResources(0, Some(&shader_resources));
+
+            self.context.Draw(3, 0);
+
+            let empty_srvs: [Option<ID3D11ShaderResourceView>; 3] = [None, None, None];
+            self.context.PSSetShaderResources(0, Some(&empty_srvs));
+
+            let empty_rtvs: [Option<ID3D11RenderTargetView>; 1] = [None];
+            self.context
+                .OMSetRenderTargets(Some(&empty_rtvs), None::<&ID3D11DepthStencilView>);
+
+            Ok(())
         }
-        (dst, phys_w, phys_h, dst_stride)
-    } else if rotation == DXGI_MODE_ROTATION_ROTATE270 {
-        // dst 尺寸：宽 = phys_h，高 = phys_w
-        let (dst_w, dst_h) = (phys_h, phys_w);
-        let dst_stride = dst_w * 4;
-        let mut dst = vec![0u8; (dst_stride * dst_h) as usize];
-        for src_y in 0..phys_h {
-            for src_x in 0..phys_w {
-                let src_off = src_y as usize * src_stride as usize + src_x as usize * 4;
-                let dst_x = src_y;
-                let dst_y = phys_w - 1 - src_x;
-                let dst_off = dst_y as usize * dst_stride as usize + dst_x as usize * 4;
-                dst[dst_off..dst_off + 4].copy_from_slice(&src[src_off..src_off + 4]);
-            }
-        }
-        (dst, dst_w, dst_h, dst_stride)
-    } else {
-        // IDENTITY / UNSPECIFIED：去除 GPU 行填充，输出紧凑行步长
-        let dst_stride = phys_w * 4;
-        let mut dst = vec![0u8; (dst_stride * phys_h) as usize];
-        for row in 0..phys_h as usize {
-            let src_row_start = row * src_stride as usize;
-            dst[row * dst_stride as usize..(row + 1) * dst_stride as usize]
-                .copy_from_slice(&src[src_row_start..src_row_start + dst_stride as usize]);
-        }
-        (dst, phys_w, phys_h, dst_stride)
     }
 }
 
-/// 将光标叠加到帧缓冲（BGRA8 格式）
-///
-/// 支持 DXGI 三种光标类型：
-/// - **MONOCHROME**：1-bpp AND/XOR 双掩码，高度为实际高度的两倍
-/// - **COLOR**：32-bit BGRA，标准预乘 Alpha 混合
-/// - **MASKED_COLOR**：32-bit BGRA，`alpha=0x00` 透明，`alpha=0xFF` 与桌面 XOR，其余 Alpha 混合
-fn draw_cursor_on_frame(
-    frame: &mut [u8],
-    frame_stride: u32,
-    frame_width: u32,
-    frame_height: u32,
-    cursor_pos: POINT,
-    shape_info: &DXGI_OUTDUPL_POINTER_SHAPE_INFO,
-    shape_buf: &[u8],
-) {
-    // 光标图像左上角 = 热点屏幕坐标 − 热点偏移
-    let left = cursor_pos.x - shape_info.HotSpot.x;
-    let top = cursor_pos.y - shape_info.HotSpot.y;
+fn to_shader_rotation(rotation: DXGI_MODE_ROTATION) -> u32 {
+    if rotation == DXGI_MODE_ROTATION_ROTATE90 {
+        ROTATION_90
+    } else if rotation == DXGI_MODE_ROTATION_ROTATE180 {
+        ROTATION_180
+    } else if rotation == DXGI_MODE_ROTATION_ROTATE270 {
+        ROTATION_270
+    } else {
+        ROTATION_IDENTITY
+    }
+}
 
-    if shape_info.Type == DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MONOCHROME.0 as u32 {
-        // 上半部分：AND 掩码；下半部分：XOR 掩码；均为 1-bpp，行宽 Pitch 字节
-        let cursor_h = (shape_info.Height / 2) as i32;
-        let cursor_w = shape_info.Width as i32;
+fn create_cursor_shape(
+    device: &ID3D11Device,
+    shape_info: DXGI_OUTDUPL_POINTER_SHAPE_INFO,
+    shape_buffer: &[u8],
+) -> Result<CursorShape, Box<dyn std::error::Error>> {
+    let shape_type = shape_info.Type;
+
+    if shape_type == DXGI_OUTDUPL_POINTER_SHAPE_TYPE_COLOR.0 as u32 {
+        let height = shape_info.Height;
+        let required = shape_info.Pitch as usize * height as usize;
+        if shape_buffer.len() < required {
+            return Err("COLOR 光标数据长度不足".into());
+        }
+
+        let srv = create_cursor_srv(
+            device,
+            shape_info.Width,
+            height,
+            DXGI_FORMAT_B8G8R8A8_UNORM,
+            &shape_buffer[..required],
+            shape_info.Pitch,
+        )?;
+
+        Ok(CursorShape {
+            info: shape_info,
+            width: shape_info.Width,
+            height,
+            texture: CursorTexture::Color(srv),
+        })
+    } else if shape_type == DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MASKED_COLOR.0 as u32 {
+        let height = shape_info.Height;
+        let required = shape_info.Pitch as usize * height as usize;
+        if shape_buffer.len() < required {
+            return Err("MASKED_COLOR 光标数据长度不足".into());
+        }
+
+        let srv = create_cursor_srv(
+            device,
+            shape_info.Width,
+            height,
+            DXGI_FORMAT_B8G8R8A8_UNORM,
+            &shape_buffer[..required],
+            shape_info.Pitch,
+        )?;
+
+        Ok(CursorShape {
+            info: shape_info,
+            width: shape_info.Width,
+            height,
+            texture: CursorTexture::MaskedColor(srv),
+        })
+    } else if shape_type == DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MONOCHROME.0 as u32 {
+        let width = shape_info.Width;
+        let height = shape_info.Height / 2;
+        if width == 0 || height == 0 {
+            return Err("MONOCHROME 光标尺寸无效".into());
+        }
+
         let pitch = shape_info.Pitch as usize;
+        let required = pitch * shape_info.Height as usize;
+        if shape_buffer.len() < required {
+            return Err("MONOCHROME 光标数据长度不足".into());
+        }
 
-        for cy in 0..cursor_h {
-            let fy = top + cy;
-            if fy < 0 || fy >= frame_height as i32 {
-                continue;
-            }
-            for cx in 0..cursor_w {
-                let fx = left + cx;
-                if fx < 0 || fx >= frame_width as i32 {
-                    continue;
-                }
+        let mut ops = vec![0u8; (width * height) as usize];
+        for y in 0..height as usize {
+            for x in 0..width as usize {
+                let byte_off = y * pitch + x / 8;
+                let bit_mask = 0x80u8 >> (x as u32 % 8);
 
-                let byte_off = cy as usize * pitch + cx as usize / 8;
-                let bit_mask = 0x80u8 >> (cx as u32 % 8);
-                let and_bit = shape_buf.get(byte_off).map_or(1u8, |b| u8::from(b & bit_mask != 0));
-                let xor_bit = shape_buf
-                    .get(byte_off + cursor_h as usize * pitch)
-                    .map_or(0u8, |b| u8::from(b & bit_mask != 0));
+                let and_bit = u8::from(shape_buffer[byte_off] & bit_mask != 0);
+                let xor_bit =
+                    u8::from(shape_buffer[byte_off + height as usize * pitch] & bit_mask != 0);
 
-                let fp = fy as usize * frame_stride as usize + fx as usize * 4;
-                if fp + 2 >= frame.len() {
-                    continue;
-                }
-
-                // screen = (screen AND and) XOR xor  (每通道)
-                // and=0,xor=0 → 黑; and=1,xor=0 → 透明; and=0,xor=1 → 白; and=1,xor=1 → 反色
-                if and_bit == 0 {
-                    let val = xor_bit * 255;
-                    frame[fp] = val;
-                    frame[fp + 1] = val;
-                    frame[fp + 2] = val;
-                } else if xor_bit == 1 {
-                    frame[fp] = !frame[fp];
-                    frame[fp + 1] = !frame[fp + 1];
-                    frame[fp + 2] = !frame[fp + 2];
-                }
+                ops[y * width as usize + x] = and_bit + (xor_bit << 1);
             }
         }
-    } else if shape_info.Type == DXGI_OUTDUPL_POINTER_SHAPE_TYPE_COLOR.0 as u32 {
-        // 32-bit BGRA，标准 Alpha 混合
-        let cursor_h = shape_info.Height as i32;
-        let cursor_w = shape_info.Width as i32;
-        let pitch = shape_info.Pitch as usize;
 
-        for cy in 0..cursor_h {
-            let fy = top + cy;
-            if fy < 0 || fy >= frame_height as i32 {
-                continue;
-            }
-            for cx in 0..cursor_w {
-                let fx = left + cx;
-                if fx < 0 || fx >= frame_width as i32 {
-                    continue;
-                }
+        let srv = create_cursor_srv(device, width, height, DXGI_FORMAT_R8_UINT, &ops, width)?;
 
-                let cp = cy as usize * pitch + cx as usize * 4;
-                let Some(&[cb, cg, cr, ca]) = shape_buf.get(cp..cp + 4)
-                    .and_then(|s| s.try_into().ok())
-                    .map(|a: &[u8; 4]| a)
-                else {
-                    continue;
-                };
-                if ca == 0 {
-                    continue;
-                }
+        Ok(CursorShape {
+            info: shape_info,
+            width,
+            height,
+            texture: CursorTexture::Monochrome(srv),
+        })
+    } else {
+        Err(format!("不支持的光标类型: {}", shape_type).into())
+    }
+}
 
-                let fp = fy as usize * frame_stride as usize + fx as usize * 4;
-                if fp + 2 >= frame.len() {
-                    continue;
-                }
+fn create_cursor_srv(
+    device: &ID3D11Device,
+    width: u32,
+    height: u32,
+    format: DXGI_FORMAT,
+    data: &[u8],
+    pitch: u32,
+) -> Result<ID3D11ShaderResourceView, Box<dyn std::error::Error>> {
+    unsafe {
+        let desc = D3D11_TEXTURE2D_DESC {
+            Width: width,
+            Height: height,
+            MipLevels: 1,
+            ArraySize: 1,
+            Format: format,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Usage: D3D11_USAGE_IMMUTABLE,
+            BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
+            CPUAccessFlags: 0,
+            MiscFlags: 0,
+        };
 
-                if ca == 255 {
-                    frame[fp] = cb;
-                    frame[fp + 1] = cg;
-                    frame[fp + 2] = cr;
-                } else {
-                    let a = ca as u32;
-                    let ia = 255 - a;
-                    frame[fp] = ((cb as u32 * a + frame[fp] as u32 * ia) / 255) as u8;
-                    frame[fp + 1] = ((cg as u32 * a + frame[fp + 1] as u32 * ia) / 255) as u8;
-                    frame[fp + 2] = ((cr as u32 * a + frame[fp + 2] as u32 * ia) / 255) as u8;
-                }
-            }
+        let subresource = D3D11_SUBRESOURCE_DATA {
+            pSysMem: data.as_ptr() as *const c_void,
+            SysMemPitch: pitch,
+            SysMemSlicePitch: pitch * height,
+        };
+
+        let mut texture = None;
+        device.CreateTexture2D(&desc, Some(&subresource), Some(&mut texture))?;
+        let texture = texture.unwrap();
+
+        let mut srv = None;
+        device.CreateShaderResourceView(&texture, None, Some(&mut srv))?;
+        srv.ok_or("创建光标 SRV 失败".into())
+    }
+}
+
+fn compile_shader_blob(
+    source: &str,
+    entry: &'static [u8],
+    target: &'static [u8],
+) -> Result<ID3DBlob, Box<dyn std::error::Error>> {
+    unsafe {
+        let mut shader_blob = None;
+        let mut error_blob = None;
+
+        let compile_result = D3DCompile(
+            source.as_ptr() as *const c_void,
+            source.len(),
+            PCSTR::null(),
+            None,
+            None::<&ID3DInclude>,
+            PCSTR(entry.as_ptr()),
+            PCSTR(target.as_ptr()),
+            D3DCOMPILE_ENABLE_STRICTNESS | D3DCOMPILE_OPTIMIZATION_LEVEL3,
+            0,
+            &mut shader_blob,
+            Some(&mut error_blob),
+        );
+
+        if let Err(err) = compile_result {
+            let compiler_msg = error_blob
+                .as_ref()
+                .map(blob_to_string)
+                .unwrap_or_else(|| err.to_string());
+            let stage =
+                std::str::from_utf8(&entry[..entry.len().saturating_sub(1)]).unwrap_or("shader");
+            return Err(format!("编译 {} 失败: {}", stage, compiler_msg).into());
         }
-    } else if shape_info.Type == DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MASKED_COLOR.0 as u32 {
-        // alpha=0xFF → XOR 桌面像素；alpha=0x00 → 透明；其余 → Alpha 混合
-        let cursor_h = shape_info.Height as i32;
-        let cursor_w = shape_info.Width as i32;
-        let pitch = shape_info.Pitch as usize;
 
-        for cy in 0..cursor_h {
-            let fy = top + cy;
-            if fy < 0 || fy >= frame_height as i32 {
-                continue;
-            }
-            for cx in 0..cursor_w {
-                let fx = left + cx;
-                if fx < 0 || fx >= frame_width as i32 {
-                    continue;
-                }
+        shader_blob.ok_or("着色器编译结果为空".into())
+    }
+}
 
-                let cp = cy as usize * pitch + cx as usize * 4;
-                let Some(&[cb, cg, cr, ca]) = shape_buf.get(cp..cp + 4)
-                    .and_then(|s| s.try_into().ok())
-                    .map(|a: &[u8; 4]| a)
-                else {
-                    continue;
-                };
+fn blob_bytes(blob: &ID3DBlob) -> &[u8] {
+    unsafe {
+        std::slice::from_raw_parts(blob.GetBufferPointer() as *const u8, blob.GetBufferSize())
+    }
+}
 
-                let fp = fy as usize * frame_stride as usize + fx as usize * 4;
-                if fp + 2 >= frame.len() {
-                    continue;
-                }
-
-                match ca {
-                    0x00 => { /* 透明，不修改 */ }
-                    0xFF => {
-                        frame[fp] ^= cb;
-                        frame[fp + 1] ^= cg;
-                        frame[fp + 2] ^= cr;
-                    }
-                    a => {
-                        let a = a as u32;
-                        let ia = 255 - a;
-                        frame[fp] = ((cb as u32 * a + frame[fp] as u32 * ia) / 255) as u8;
-                        frame[fp + 1] = ((cg as u32 * a + frame[fp + 1] as u32 * ia) / 255) as u8;
-                        frame[fp + 2] = ((cr as u32 * a + frame[fp + 2] as u32 * ia) / 255) as u8;
-                    }
-                }
-            }
-        }
+fn blob_to_string(blob: &ID3DBlob) -> String {
+    unsafe {
+        let bytes =
+            std::slice::from_raw_parts(blob.GetBufferPointer() as *const u8, blob.GetBufferSize());
+        String::from_utf8_lossy(bytes)
+            .trim_end_matches('\0')
+            .to_string()
     }
 }
