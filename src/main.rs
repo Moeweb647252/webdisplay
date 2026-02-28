@@ -1,5 +1,6 @@
 mod capture;
 mod encode;
+mod input;
 mod protocol;
 mod server;
 mod transport;
@@ -16,11 +17,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Setup logger with default info level
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
-    log::info!("=== 超低延迟串流服务器启动 ===");
+    log::info!("=== 串流服务器启动 ===");
 
     // 获取并序列化初始显示器列表
-    let monitors = DdaCapture::enumerate_monitors().unwrap_or_default();
-    for m in &monitors {
+    let monitors = Arc::new(DdaCapture::enumerate_monitors().unwrap_or_default());
+    for m in monitors.as_ref() {
         log::info!(
             "发现显示器 {}: {} ({}x{}){}",
             m.index,
@@ -30,10 +31,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             if m.primary { " [主屏]" } else { "" }
         );
     }
-    let monitor_list_json = Arc::new(serde_json::to_vec(&monitors).unwrap_or_default());
+    let monitor_list_json = Arc::new(serde_json::to_vec(monitors.as_ref()).unwrap_or_default());
 
     // 初始化 WebSocket 服务器
-    let ws_server = Arc::new(WebSocketServer::new(monitor_list_json));
+    let ws_server = Arc::new(WebSocketServer::new(monitor_list_json, monitors));
 
     // 初始化 TLS
     let tls_config = server::tls::get_tls_config()?;

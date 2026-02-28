@@ -132,6 +132,8 @@ pub struct DdaCapture {
 pub struct MonitorInfo {
     pub index: u32,
     pub name: String,
+    pub left: i32,
+    pub top: i32,
     pub width: u32,
     pub height: u32,
     pub primary: bool,
@@ -212,6 +214,8 @@ impl DdaCapture {
                         monitors.push(MonitorInfo {
                             index,
                             name,
+                            left: desc.DesktopCoordinates.left,
+                            top: desc.DesktopCoordinates.top,
                             width,
                             height,
                             primary,

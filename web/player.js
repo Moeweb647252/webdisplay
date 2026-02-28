@@ -12,11 +12,12 @@ const HEADER_SIZE = 16;
 // 帧类型
 const FRAME_TYPE = {
     VIDEO: 0x01,
-    VIDEO: 0x01,
     KEYFRAME_REQUEST: 0x02,
     STATS: 0x03,
     MONITOR_LIST: 0x04,
     MONITOR_SELECT: 0x05,
+    MOUSE_INPUT: 0x06,
+    KEYBOARD_INPUT: 0x07,
     PING: 0x10,
     PONG: 0x11,
 };
@@ -35,10 +36,16 @@ class UltraLowLatencyPlayer {
         this.statusEl = document.getElementById('connection-status');
         this.monitorPicker = document.getElementById('monitor-picker');
         this.monitorListEl = document.getElementById('monitor-list');
+        this.controlHintEl = document.getElementById('control-hint');
+        this.baseControlHint = this.controlHintEl ? this.controlHintEl.textContent : '';
 
         this.decoder = null;
         this.ws = null;
         this.connected = false;
+        this.autoReconnect = true;
+        this.reconnectTimer = null;
+        this.hintTimer = null;
+        this.hintHideTimer = null;
 
         // 统计
         this.stats = {
@@ -52,6 +59,20 @@ class UltraLowLatencyPlayer {
             bitrateBytes: 0,
             bitrateMbps: 0,
         };
+
+        // 输入控制状态
+        this.controlActive = false;
+        this.pressedKeys = new Map();
+        this.pressedButtons = new Set();
+        this.lastPointerPos = { x: 0.5, y: 0.5 };
+        this.pendingMouseMoveEvent = null;
+        this.mouseMoveScheduled = false;
+        this.showLocalCursor = false;
+        this.lockPointerToVideo = false;
+
+        this.textEncoder = new TextEncoder();
+        this.textDecoder = new TextDecoder();
+        this.canvas.tabIndex = 0;
 
         // 最新待渲染的帧（原子替换，旧帧自动丢弃）
         this.pendingFrame = null;
@@ -82,17 +103,8 @@ class UltraLowLatencyPlayer {
         this._connect();
         requestAnimationFrame(this.renderBound);
         this._startStatsUpdate();
-
-        // 按 Tab 切换 overlay 显示, 按 M 切换显示器选择
-        document.addEventListener('keydown', (e) => {
-            if (e.key === 'Tab') {
-                e.preventDefault();
-                this.overlay.classList.toggle('hidden');
-            } else if (e.key.toLowerCase() === 'm') {
-                e.preventDefault();
-                this.monitorPicker.classList.toggle('hidden');
-            }
-        });
+        this._bindInputEvents();
+        this._showControlHint(4500);
     }
 
     /**
@@ -135,6 +147,15 @@ class UltraLowLatencyPlayer {
      * 建立 WebSocket 连接
      */
     _connect() {
+        if (this.reconnectTimer) {
+            clearTimeout(this.reconnectTimer);
+            this.reconnectTimer = null;
+        }
+
+        if (this.ws && (this.ws.readyState === WebSocket.OPEN || this.ws.readyState === WebSocket.CONNECTING)) {
+            return;
+        }
+
         const wsProtocol = location.protocol === 'https:' ? 'wss' : 'ws';
         const wsUrl = `${wsProtocol}://${location.host}/ws`;
         console.log('连接到:', wsUrl);
@@ -145,6 +166,7 @@ class UltraLowLatencyPlayer {
         this.ws.onopen = () => {
             console.log('WebSocket 已连接');
             this.connected = true;
+            this.autoReconnect = true;
             this.statusEl.style.display = 'none';
             // 连接后立即请求关键帧
             this._requestKeyframe();
@@ -158,14 +180,527 @@ class UltraLowLatencyPlayer {
         this.ws.onclose = () => {
             console.log('WebSocket 已断开');
             this.connected = false;
+            this._releaseAllInputs();
+            this.controlActive = false;
+            this._exitPointerLock();
+            this._applyCursorVisibility();
             this.statusEl.style.display = 'block';
-            this.statusEl.innerHTML = '<span class="dot disconnected"></span> 连接断开，3秒后重连...';
-            setTimeout(() => this._connect(), 3000);
+
+            if (this.autoReconnect) {
+                this.statusEl.innerHTML = '<span class="dot disconnected"></span> 连接断开，3秒后重连...';
+                this.reconnectTimer = setTimeout(() => {
+                    this.reconnectTimer = null;
+                    this._connect();
+                }, 3000);
+            } else {
+                this.statusEl.innerHTML = '<span class="dot disconnected"></span> 会话已退出，按 Ctrl+Alt+Shift+Q 重连';
+            }
         };
 
         this.ws.onerror = (e) => {
             console.error('WebSocket 错误:', e);
         };
+    }
+
+    _bindInputEvents() {
+        window.addEventListener('keydown', (e) => {
+            if (this._handleMoonlightShortcutKeyDown(e)) {
+                return;
+            }
+
+            if (!this.controlActive) {
+                return;
+            }
+
+            if (e.key === 'Escape') {
+                e.preventDefault();
+                this._deactivateControl();
+                return;
+            }
+
+            if (e.isComposing) return;
+            e.preventDefault();
+            this._sendKeyboardInput(e, true);
+        }, true);
+
+        window.addEventListener('keyup', (e) => {
+            if (this._handleMoonlightShortcutKeyUp(e)) {
+                return;
+            }
+
+            if (!this.controlActive || e.key === 'Escape' || e.isComposing) {
+                return;
+            }
+            e.preventDefault();
+            this._sendKeyboardInput(e, false);
+        }, true);
+
+        this.canvas.addEventListener('mousedown', (e) => {
+            e.preventDefault();
+            this._activateControl();
+
+            const pos = this._capturePointerPositionFromMouse(e);
+            this.pressedButtons.add(e.button);
+            this._sendMouseInput({
+                kind: 'button',
+                x: pos.x,
+                y: pos.y,
+                button: e.button,
+                down: true,
+            });
+        });
+
+        this.canvas.addEventListener('mousemove', (e) => {
+            if (!this.controlActive) return;
+
+            if (this._isPointerLocked()) {
+                this.pendingMouseMoveEvent = {
+                    mode: 'relative',
+                    movementX: e.movementX,
+                    movementY: e.movementY,
+                };
+            } else {
+                this.pendingMouseMoveEvent = {
+                    mode: 'absolute',
+                    clientX: e.clientX,
+                    clientY: e.clientY,
+                };
+            }
+
+            this._scheduleMouseMove();
+        });
+
+        const releaseMouseButton = (e) => {
+            if (!this.controlActive || !this.pressedButtons.has(e.button)) {
+                return;
+            }
+
+            e.preventDefault();
+            const pos = this._capturePointerPositionFromMouse(e);
+            this.pressedButtons.delete(e.button);
+            this._sendMouseInput({
+                kind: 'button',
+                x: pos.x,
+                y: pos.y,
+                button: e.button,
+                down: false,
+            });
+        };
+
+        this.canvas.addEventListener('mouseup', releaseMouseButton);
+        window.addEventListener('mouseup', releaseMouseButton, true);
+
+        this.canvas.addEventListener('wheel', (e) => {
+            if (!this.controlActive) return;
+
+            e.preventDefault();
+            const pos = this._capturePointerPositionFromMouse(e);
+            const unit = e.deltaMode === WheelEvent.DOM_DELTA_LINE ? 40
+                : e.deltaMode === WheelEvent.DOM_DELTA_PAGE ? 120
+                    : 1;
+            const deltaX = Math.round(e.deltaX * unit);
+            const deltaY = Math.round(-e.deltaY * unit);
+            if (deltaX === 0 && deltaY === 0) return;
+
+            this._sendMouseInput({
+                kind: 'wheel',
+                x: pos.x,
+                y: pos.y,
+                delta_x: deltaX,
+                delta_y: deltaY,
+            });
+        }, { passive: false });
+
+        this.canvas.addEventListener('contextmenu', (e) => {
+            if (this.controlActive) {
+                e.preventDefault();
+            }
+        });
+
+        window.addEventListener('blur', () => {
+            this._deactivateControl();
+        });
+
+        document.addEventListener('visibilitychange', () => {
+            if (document.hidden) {
+                this._deactivateControl();
+            }
+        });
+
+        document.addEventListener('pointerlockchange', () => {
+            if (this.lockPointerToVideo && this.controlActive && !this._isPointerLocked()) {
+                this._flashHint('鼠标锁定已解除，按 Ctrl+Alt+Shift+L 重新锁定');
+            }
+        });
+
+        window.addEventListener('mousemove', (e) => {
+            if (e.clientY >= window.innerHeight - 72) {
+                this._showControlHint(2400);
+            }
+        }, { passive: true });
+
+        window.addEventListener('touchstart', () => {
+            this._showControlHint(2400);
+        }, { passive: true });
+    }
+
+    _isMoonlightShortcutChord(e) {
+        return e.ctrlKey && e.altKey && e.shiftKey && !e.metaKey;
+    }
+
+    _moonlightShortcutAction(code) {
+        switch (code) {
+            case 'KeyQ':
+                return 'quit';
+            case 'KeyZ':
+                return 'capture';
+            case 'KeyX':
+                return 'fullscreen';
+            case 'KeyS':
+                return 'stats';
+            case 'KeyM':
+                return 'monitor';
+            case 'KeyL':
+                return 'lock';
+            case 'KeyC':
+                return 'cursor';
+            case 'KeyV':
+                return 'clipboard';
+            case 'KeyD':
+                return 'minimize';
+            default:
+                return null;
+        }
+    }
+
+    _handleMoonlightShortcutKeyDown(e) {
+        if (!this._isMoonlightShortcutChord(e)) {
+            return false;
+        }
+
+        const action = this._moonlightShortcutAction(e.code);
+        if (!action) {
+            return false;
+        }
+
+        e.preventDefault();
+        e.stopPropagation();
+        this._showControlHint(2600);
+        if (e.repeat) {
+            return true;
+        }
+
+        switch (action) {
+            case 'quit':
+                this._toggleStreamSession();
+                break;
+            case 'capture':
+                if (this.controlActive) {
+                    this._deactivateControl();
+                    this._flashHint('输入控制已释放');
+                } else {
+                    this._activateControl();
+                    this._flashHint('输入控制已激活');
+                }
+                break;
+            case 'fullscreen':
+                this._toggleFullscreen();
+                break;
+            case 'stats':
+                this.overlay.classList.toggle('hidden');
+                break;
+            case 'monitor':
+                this.monitorPicker.classList.toggle('hidden');
+                break;
+            case 'lock':
+                this.lockPointerToVideo = !this.lockPointerToVideo;
+                if (!this.controlActive || this.showLocalCursor) {
+                    if (!this.lockPointerToVideo) {
+                        this._exitPointerLock();
+                    }
+                } else if (this.lockPointerToVideo) {
+                    this._requestPointerLock();
+                } else {
+                    this._exitPointerLock();
+                }
+                this._flashHint(`鼠标锁定${this.lockPointerToVideo ? '已开启' : '已关闭'}`);
+                break;
+            case 'cursor':
+                this.showLocalCursor = !this.showLocalCursor;
+                this._applyCursorVisibility();
+                if (this.showLocalCursor) {
+                    this._exitPointerLock();
+                } else if (this.controlActive && this.lockPointerToVideo) {
+                    this._requestPointerLock();
+                }
+                this._flashHint(`本地光标${this.showLocalCursor ? '显示' : '隐藏'}`);
+                break;
+            case 'clipboard':
+                this._flashHint('浏览器版暂不支持 Ctrl+Alt+Shift+V 粘贴');
+                break;
+            case 'minimize':
+                this._flashHint('浏览器版暂不支持 Ctrl+Alt+Shift+D 最小化');
+                break;
+            default:
+                break;
+        }
+
+        return true;
+    }
+
+    _handleMoonlightShortcutKeyUp(e) {
+        if (!this._isMoonlightShortcutChord(e)) {
+            return false;
+        }
+
+        const action = this._moonlightShortcutAction(e.code);
+        if (!action) {
+            return false;
+        }
+
+        e.preventDefault();
+        e.stopPropagation();
+        return true;
+    }
+
+    _toggleStreamSession() {
+        if (this.ws && (this.ws.readyState === WebSocket.OPEN || this.ws.readyState === WebSocket.CONNECTING)) {
+            this.autoReconnect = false;
+            this._deactivateControl();
+            this.ws.close(1000, 'client quit');
+            this._flashHint('会话已退出');
+            return;
+        }
+
+        this.autoReconnect = true;
+        this.statusEl.style.display = 'block';
+        this.statusEl.innerHTML = '<span class="dot disconnected"></span> 正在连接...';
+        this._connect();
+        this._flashHint('正在重新连接');
+    }
+
+    _toggleFullscreen() {
+        if (document.fullscreenElement) {
+            document.exitFullscreen().catch(() => { });
+        } else {
+            document.documentElement.requestFullscreen().catch(() => { });
+        }
+    }
+
+    _showControlHint(autoHideMs = 3000) {
+        if (!this.controlHintEl) {
+            return;
+        }
+
+        this.controlHintEl.classList.remove('hidden');
+
+        if (this.hintHideTimer) {
+            clearTimeout(this.hintHideTimer);
+            this.hintHideTimer = null;
+        }
+
+        if (autoHideMs <= 0) {
+            return;
+        }
+
+        this.hintHideTimer = setTimeout(() => {
+            this.controlHintEl.classList.add('hidden');
+            this.hintHideTimer = null;
+        }, autoHideMs);
+    }
+
+    _flashHint(text) {
+        if (!this.controlHintEl) {
+            return;
+        }
+
+        this.controlHintEl.textContent = text;
+        this._showControlHint(2500);
+        if (this.hintTimer) {
+            clearTimeout(this.hintTimer);
+        }
+
+        this.hintTimer = setTimeout(() => {
+            this.controlHintEl.textContent = this.baseControlHint;
+            this._showControlHint(3200);
+            this.hintTimer = null;
+        }, 2200);
+    }
+
+    _isPointerLocked() {
+        return document.pointerLockElement === this.canvas;
+    }
+
+    _requestPointerLock() {
+        if (this._isPointerLocked()) {
+            return;
+        }
+
+        this.canvas.requestPointerLock();
+    }
+
+    _exitPointerLock() {
+        if (this._isPointerLocked()) {
+            document.exitPointerLock();
+        }
+    }
+
+    _applyCursorVisibility() {
+        this.canvas.classList.toggle('show-local-cursor', this.showLocalCursor);
+    }
+
+    _activateControl() {
+        if (this.controlActive) return;
+        this.controlActive = true;
+        this.canvas.focus({ preventScroll: true });
+        this._applyCursorVisibility();
+
+        if (this.lockPointerToVideo && !this.showLocalCursor) {
+            this._requestPointerLock();
+        }
+
+        console.log('远程输入已激活，按 Ctrl+Alt+Shift+Z 或 Esc 释放');
+    }
+
+    _deactivateControl() {
+        if (!this.controlActive && this.pressedKeys.size === 0 && this.pressedButtons.size === 0) {
+            return;
+        }
+
+        this._releaseAllInputs();
+        this.controlActive = false;
+        this.pendingMouseMoveEvent = null;
+        this.mouseMoveScheduled = false;
+        this._exitPointerLock();
+        this._applyCursorVisibility();
+        this.canvas.blur();
+    }
+
+    _releaseAllInputs() {
+        if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+            for (const keyInfo of this.pressedKeys.values()) {
+                this._sendJsonControlPacket(FRAME_TYPE.KEYBOARD_INPUT, {
+                    key_code: keyInfo.keyCode,
+                    code: keyInfo.code,
+                    down: false,
+                });
+            }
+
+            for (const button of this.pressedButtons.values()) {
+                this._sendMouseInput({
+                    kind: 'button',
+                    x: this.lastPointerPos.x,
+                    y: this.lastPointerPos.y,
+                    button,
+                    down: false,
+                });
+            }
+        }
+
+        this.pressedKeys.clear();
+        this.pressedButtons.clear();
+    }
+
+    _scheduleMouseMove() {
+        if (this.mouseMoveScheduled) return;
+
+        this.mouseMoveScheduled = true;
+        requestAnimationFrame(() => {
+            this.mouseMoveScheduled = false;
+
+            if (!this.controlActive || !this.pendingMouseMoveEvent) {
+                return;
+            }
+
+            let pos = this.lastPointerPos;
+            if (this.pendingMouseMoveEvent.mode === 'relative') {
+                pos = this._normalizePointerDelta(
+                    this.pendingMouseMoveEvent.movementX,
+                    this.pendingMouseMoveEvent.movementY,
+                );
+            } else {
+                pos = this._normalizePointer(
+                    this.pendingMouseMoveEvent.clientX,
+                    this.pendingMouseMoveEvent.clientY,
+                );
+            }
+
+            this.pendingMouseMoveEvent = null;
+            this.lastPointerPos = pos;
+            this._sendMouseInput({ kind: 'move', x: pos.x, y: pos.y });
+        });
+    }
+
+    _capturePointerPositionFromMouse(e) {
+        const pos = this._normalizePointer(e.clientX, e.clientY);
+        this.lastPointerPos = pos;
+        return pos;
+    }
+
+    _normalizePointer(clientX, clientY) {
+        if (typeof clientX !== 'number' || typeof clientY !== 'number') {
+            return this.lastPointerPos;
+        }
+
+        const rect = this.canvas.getBoundingClientRect();
+        if (rect.width <= 0 || rect.height <= 0) {
+            return this.lastPointerPos;
+        }
+
+        const x = Math.min(Math.max((clientX - rect.left) / rect.width, 0), 1);
+        const y = Math.min(Math.max((clientY - rect.top) / rect.height, 0), 1);
+        return { x, y };
+    }
+
+    _normalizePointerDelta(movementX, movementY) {
+        const rect = this.canvas.getBoundingClientRect();
+        if (rect.width <= 0 || rect.height <= 0) {
+            return this.lastPointerPos;
+        }
+
+        const x = Math.min(Math.max(this.lastPointerPos.x + movementX / rect.width, 0), 1);
+        const y = Math.min(Math.max(this.lastPointerPos.y + movementY / rect.height, 0), 1);
+        return { x, y };
+    }
+
+    _sendMouseInput(payload) {
+        this._sendJsonControlPacket(FRAME_TYPE.MOUSE_INPUT, payload);
+    }
+
+    _sendKeyboardInput(event, down) {
+        const keyCode = event.keyCode || event.which || 0;
+        const code = event.code || null;
+        if (keyCode === 0 && !code) {
+            return;
+        }
+
+        const keyId = code || `kc-${keyCode}`;
+        if (down) {
+            this.pressedKeys.set(keyId, { keyCode, code });
+        } else {
+            this.pressedKeys.delete(keyId);
+        }
+
+        this._sendJsonControlPacket(FRAME_TYPE.KEYBOARD_INPUT, {
+            key_code: keyCode,
+            code,
+            down,
+        });
+    }
+
+    _sendJsonControlPacket(frameType, payloadObj) {
+        if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+
+        const payload = this.textEncoder.encode(JSON.stringify(payloadObj));
+        const header = new ArrayBuffer(HEADER_SIZE);
+        const view = new DataView(header);
+        view.setUint8(0, frameType);
+        view.setUint32(10, payload.byteLength, true);
+
+        const packet = new Uint8Array(HEADER_SIZE + payload.byteLength);
+        packet.set(new Uint8Array(header), 0);
+        packet.set(payload, HEADER_SIZE);
+        this.ws.send(packet.buffer);
     }
 
     /**
@@ -185,7 +720,7 @@ class UltraLowLatencyPlayer {
 
         if (frameType === FRAME_TYPE.MONITOR_LIST) {
             try {
-                const jsonStr = new TextDecoder().decode(payload);
+                const jsonStr = this.textDecoder.decode(payload);
                 const monitors = JSON.parse(jsonStr);
                 this._updateMonitorList(monitors);
             } catch (e) {
@@ -334,20 +869,7 @@ class UltraLowLatencyPlayer {
     _requestMonitorSwitch(index) {
         if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
 
-        const req = { index };
-        const payloadJson = JSON.stringify(req);
-        const payload = new TextEncoder().encode(payloadJson);
-
-        const header = new ArrayBuffer(HEADER_SIZE);
-        const view = new DataView(header);
-        view.setUint8(0, FRAME_TYPE.MONITOR_SELECT);
-        view.setUint32(10, payload.byteLength, true); // payload_len
-
-        const packet = new Uint8Array(HEADER_SIZE + payload.byteLength);
-        packet.set(new Uint8Array(header), 0);
-        packet.set(payload, HEADER_SIZE);
-
-        this.ws.send(packet.buffer);
+        this._sendJsonControlPacket(FRAME_TYPE.MONITOR_SELECT, { index });
         console.log('已请求切换显示器到', index);
 
         // 隐藏面板并请求关键帧加速画面出现

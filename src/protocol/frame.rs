@@ -24,6 +24,10 @@ pub enum FrameType {
     MonitorList = 0x04,
     /// 选择显示器 (客户端 → 服务端)
     MonitorSelect = 0x05,
+    /// 鼠标输入 (客户端 → 服务端)
+    MouseInput = 0x06,
+    /// 键盘输入 (客户端 → 服务端)
+    KeyboardInput = 0x07,
     /// 心跳包
     Ping = 0x10,
     Pong = 0x11,
@@ -72,6 +76,8 @@ impl FrameHeader {
             0x03 => FrameType::Stats,
             0x04 => FrameType::MonitorList,
             0x05 => FrameType::MonitorSelect,
+            0x06 => FrameType::MouseInput,
+            0x07 => FrameType::KeyboardInput,
             0x10 => FrameType::Ping,
             0x11 => FrameType::Pong,
             _ => return None,

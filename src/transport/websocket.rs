@@ -1,10 +1,13 @@
-use crate::capture::dda::DdaCapture;
+use crate::capture::dda::{DdaCapture, MonitorInfo};
 use crate::encode::av1_amf::{Av1AmfEncoder, EncoderConfig};
+use crate::input::win32::{ActiveMonitor, InputInjector};
 use crate::protocol::frame::{FrameFlags, FrameHeader, FrameType};
 use axum::extract::State;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::response::IntoResponse;
 use futures_util::StreamExt;
+use serde::Deserialize;
+use serde::de::DeserializeOwned;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -25,6 +28,40 @@ enum ClientConnectionState {
     Closed,
 }
 
+#[derive(Debug, Deserialize)]
+struct MonitorSelectPayload {
+    index: u32,
+}
+
+#[derive(Debug, Deserialize)]
+struct KeyboardInputPayload {
+    key_code: u16,
+    down: bool,
+    #[serde(default)]
+    code: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum MouseInputPayload {
+    Move {
+        x: f32,
+        y: f32,
+    },
+    Button {
+        x: f32,
+        y: f32,
+        button: u8,
+        down: bool,
+    },
+    Wheel {
+        x: f32,
+        y: f32,
+        delta_x: i32,
+        delta_y: i32,
+    },
+}
+
 /// WebSocket 串流服务器
 ///
 /// 最大传输单元考虑：
@@ -36,11 +73,16 @@ enum ClientConnectionState {
 pub struct WebSocketServer {
     /// 缓存的显示器列表 JSON 数据
     monitor_list_json: Arc<Vec<u8>>,
+    /// 显示器元数据（用于输入坐标映射）
+    monitors: Arc<Vec<MonitorInfo>>,
 }
 
 impl WebSocketServer {
-    pub fn new(monitor_list_json: Arc<Vec<u8>>) -> Self {
-        Self { monitor_list_json }
+    pub fn new(monitor_list_json: Arc<Vec<u8>>, monitors: Arc<Vec<MonitorInfo>>) -> Self {
+        Self {
+            monitor_list_json,
+            monitors,
+        }
     }
 
     pub async fn websocket_upgrade(
@@ -57,10 +99,11 @@ impl WebSocketServer {
     /// 为单个客户端启动独立服务（捕获 + 编码 + 发送 + 控制）
     async fn handle_client(&self, socket: WebSocket) -> Result<(), String> {
         let monitor_list_json = self.monitor_list_json.clone();
+        let monitors = self.monitors.clone();
         let runtime = tokio::runtime::Handle::current();
 
         let task = tokio::task::spawn_blocking(move || {
-            Self::run_client_service(runtime, socket, monitor_list_json)
+            Self::run_client_service(runtime, socket, monitor_list_json, monitors)
         });
 
         match task.await {
@@ -73,6 +116,7 @@ impl WebSocketServer {
         runtime: tokio::runtime::Handle,
         mut socket: WebSocket,
         monitor_list_json: Arc<Vec<u8>>,
+        monitors: Arc<Vec<MonitorInfo>>,
     ) -> Result<(), String> {
         // 建立连接后立即发送显示器列表
         Self::send_monitor_list(&runtime, &mut socket, monitor_list_json.as_ref())?;
@@ -82,6 +126,20 @@ impl WebSocketServer {
         let mut encoder =
             Av1AmfEncoder::new(&Self::encoder_config(capturer.width(), capturer.height()))
                 .map_err(|e| e.to_string())?;
+        let mut active_monitor = Self::active_monitor(
+            monitors.as_ref(),
+            current_monitor_index,
+            capturer.width(),
+            capturer.height(),
+        );
+
+        let input_injector = match InputInjector::new() {
+            Ok(injector) => Some(injector),
+            Err(e) => {
+                log::warn!("初始化输入注入失败，将禁用远程输入: {}", e);
+                None
+            }
+        };
 
         let mut force_keyframe = true;
         let mut pending_monitor_switch = None::<u32>;
@@ -105,6 +163,8 @@ impl WebSocketServer {
                 &mut socket,
                 &mut force_keyframe,
                 &mut pending_monitor_switch,
+                input_injector.as_ref(),
+                active_monitor,
             )? {
                 ClientConnectionState::Alive => {}
                 ClientConnectionState::Closed => {
@@ -121,6 +181,12 @@ impl WebSocketServer {
                     &mut encoder,
                 )? {
                     force_keyframe = true;
+                    active_monitor = Self::active_monitor(
+                        monitors.as_ref(),
+                        current_monitor_index,
+                        capturer.width(),
+                        capturer.height(),
+                    );
                 }
             }
 
@@ -215,6 +281,8 @@ impl WebSocketServer {
         socket: &mut WebSocket,
         force_keyframe: &mut bool,
         pending_monitor_switch: &mut Option<u32>,
+        input_injector: Option<&InputInjector>,
+        active_monitor: ActiveMonitor,
     ) -> Result<ClientConnectionState, String> {
         loop {
             let next_msg =
@@ -229,6 +297,8 @@ impl WebSocketServer {
                         &data,
                         force_keyframe,
                         pending_monitor_switch,
+                        input_injector,
+                        active_monitor,
                     );
                 }
                 Some(Ok(Message::Ping(payload))) => {
@@ -254,6 +324,8 @@ impl WebSocketServer {
         data: &[u8],
         force_keyframe: &mut bool,
         pending_monitor_switch: &mut Option<u32>,
+        input_injector: Option<&InputInjector>,
+        active_monitor: ActiveMonitor,
     ) {
         if data.len() < FrameHeader::SIZE {
             return;
@@ -275,20 +347,65 @@ impl WebSocketServer {
                     *pending_monitor_switch = Some(index);
                 }
             }
+            FrameType::MouseInput => {
+                if let (Some(injector), Some(mouse_input)) = (
+                    input_injector,
+                    Self::parse_json_payload::<MouseInputPayload>(data, header.payload_len),
+                ) {
+                    if let Err(e) = Self::apply_mouse_input(injector, active_monitor, mouse_input) {
+                        log::debug!("处理鼠标输入失败: {}", e);
+                    }
+                }
+            }
+            FrameType::KeyboardInput => {
+                if let (Some(injector), Some(keyboard_input)) = (
+                    input_injector,
+                    Self::parse_json_payload::<KeyboardInputPayload>(data, header.payload_len),
+                ) {
+                    if let Err(e) = injector.keyboard_key(
+                        keyboard_input.key_code,
+                        keyboard_input.code.as_deref(),
+                        keyboard_input.down,
+                    ) {
+                        log::debug!("处理键盘输入失败: {}", e);
+                    }
+                }
+            }
             _ => {}
         }
     }
 
+    fn apply_mouse_input(
+        injector: &InputInjector,
+        active_monitor: ActiveMonitor,
+        mouse_input: MouseInputPayload,
+    ) -> Result<(), String> {
+        match mouse_input {
+            MouseInputPayload::Move { x, y } => injector.move_mouse(active_monitor, x, y),
+            MouseInputPayload::Button { x, y, button, down } => {
+                injector.mouse_button(active_monitor, x, y, button, down)
+            }
+            MouseInputPayload::Wheel {
+                x,
+                y,
+                delta_x,
+                delta_y,
+            } => injector.mouse_wheel(active_monitor, x, y, delta_x, delta_y),
+        }
+    }
+
     fn parse_monitor_index(data: &[u8], payload_len: u32) -> Option<u32> {
+        Self::parse_json_payload::<MonitorSelectPayload>(data, payload_len).map(|v| v.index)
+    }
+
+    fn parse_json_payload<T: DeserializeOwned>(data: &[u8], payload_len: u32) -> Option<T> {
         let start = FrameHeader::SIZE;
         let end = start.checked_add(payload_len as usize)?;
         if end > data.len() {
             return None;
         }
 
-        let json = std::str::from_utf8(&data[start..end]).ok()?;
-        let val = serde_json::from_str::<serde_json::Value>(json).ok()?;
-        val.get("index").and_then(|v| v.as_u64()).map(|v| v as u32)
+        serde_json::from_slice(&data[start..end]).ok()
     }
 
     fn switch_monitor(
@@ -327,6 +444,24 @@ impl WebSocketServer {
 
         log::info!("显示器切换成功：{}x{}", capturer.width(), capturer.height());
         Ok(true)
+    }
+
+    fn active_monitor(
+        monitors: &[MonitorInfo],
+        monitor_index: u32,
+        fallback_width: u32,
+        fallback_height: u32,
+    ) -> ActiveMonitor {
+        monitors
+            .iter()
+            .find(|m| m.index == monitor_index)
+            .map(ActiveMonitor::from_info)
+            .unwrap_or(ActiveMonitor {
+                left: 0,
+                top: 0,
+                width: fallback_width,
+                height: fallback_height,
+            })
     }
 
     fn encoder_config(width: u32, height: u32) -> EncoderConfig {
