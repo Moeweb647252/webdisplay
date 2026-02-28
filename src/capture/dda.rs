@@ -1,3 +1,4 @@
+use windows::Win32::Foundation::POINT;
 use windows::Win32::Graphics::Direct3D::*;
 use windows::Win32::Graphics::Direct3D11::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
@@ -11,6 +12,9 @@ pub struct DdaCapture {
     width: u32,
     height: u32,
     staging_texture: ID3D11Texture2D,
+    cursor_shape: Option<CursorShape>,
+    cursor_visible: bool,
+    cursor_pos: POINT,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -26,6 +30,12 @@ pub struct MonitorInfo {
 pub struct CapturedFrame {
     pub data: Vec<u8>,
     pub stride: u32,
+}
+
+/// 缓存的光标形状数据
+struct CursorShape {
+    info: DXGI_OUTDUPL_POINTER_SHAPE_INFO,
+    buffer: Vec<u8>,
 }
 
 impl DdaCapture {
@@ -160,6 +170,9 @@ impl DdaCapture {
                 width,
                 height,
                 staging_texture,
+                cursor_shape: None,
+                cursor_visible: false,
+                cursor_pos: POINT::default(),
             })
         }
     }
@@ -191,6 +204,35 @@ impl DdaCapture {
                 Err(e) => return Err(e.into()),
             }
 
+            // 更新光标形状（仅当形状发生变化时）
+            if frame_info.PointerShapeBufferSize > 0 {
+                let buf_size = frame_info.PointerShapeBufferSize;
+                let mut shape_buffer = vec![0u8; buf_size as usize];
+                let mut shape_info = DXGI_OUTDUPL_POINTER_SHAPE_INFO::default();
+                let mut size_needed = 0u32;
+                if self
+                    .duplication
+                    .GetFramePointerShape(
+                        buf_size,
+                        shape_buffer.as_mut_ptr() as *mut _,
+                        &mut size_needed,
+                        &mut shape_info,
+                    )
+                    .is_ok()
+                {
+                    self.cursor_shape = Some(CursorShape {
+                        info: shape_info,
+                        buffer: shape_buffer,
+                    });
+                }
+            }
+
+            // 更新光标位置（仅当鼠标状态发生变化时）
+            if frame_info.LastMouseUpdateTime != 0 {
+                self.cursor_visible = frame_info.PointerPosition.Visible.as_bool();
+                self.cursor_pos = frame_info.PointerPosition.Position;
+            }
+
             let resource = resource.unwrap();
             let texture: ID3D11Texture2D = resource.cast()?;
 
@@ -211,10 +253,25 @@ impl DdaCapture {
             let stride = mapped.RowPitch;
             let data_size = (stride * self.height) as usize;
             let src_slice = std::slice::from_raw_parts(mapped.pData as *const u8, data_size);
-            let data = src_slice.to_vec();
+            let mut data = src_slice.to_vec();
 
             self.context.Unmap(&self.staging_texture, 0);
             self.duplication.ReleaseFrame()?;
+
+            // 将光标叠加混合到帧数据上
+            if self.cursor_visible {
+                if let Some(ref shape) = self.cursor_shape {
+                    draw_cursor_on_frame(
+                        &mut data,
+                        stride,
+                        self.width,
+                        self.height,
+                        self.cursor_pos,
+                        &shape.info,
+                        &shape.buffer,
+                    );
+                }
+            }
 
             Ok(Some(CapturedFrame { data, stride }))
         }
@@ -226,5 +283,163 @@ impl DdaCapture {
 
     pub fn height(&self) -> u32 {
         self.height
+    }
+}
+
+/// 将光标叠加到帧缓冲（BGRA8 格式）
+///
+/// 支持 DXGI 三种光标类型：
+/// - **MONOCHROME**：1-bpp AND/XOR 双掩码，高度为实际高度的两倍
+/// - **COLOR**：32-bit BGRA，标准预乘 Alpha 混合
+/// - **MASKED_COLOR**：32-bit BGRA，`alpha=0x00` 透明，`alpha=0xFF` 与桌面 XOR，其余 Alpha 混合
+fn draw_cursor_on_frame(
+    frame: &mut [u8],
+    frame_stride: u32,
+    frame_width: u32,
+    frame_height: u32,
+    cursor_pos: POINT,
+    shape_info: &DXGI_OUTDUPL_POINTER_SHAPE_INFO,
+    shape_buf: &[u8],
+) {
+    // 光标图像左上角 = 热点屏幕坐标 − 热点偏移
+    let left = cursor_pos.x - shape_info.HotSpot.x;
+    let top = cursor_pos.y - shape_info.HotSpot.y;
+
+    if shape_info.Type == DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MONOCHROME.0 as u32 {
+        // 上半部分：AND 掩码；下半部分：XOR 掩码；均为 1-bpp，行宽 Pitch 字节
+        let cursor_h = (shape_info.Height / 2) as i32;
+        let cursor_w = shape_info.Width as i32;
+        let pitch = shape_info.Pitch as usize;
+
+        for cy in 0..cursor_h {
+            let fy = top + cy;
+            if fy < 0 || fy >= frame_height as i32 {
+                continue;
+            }
+            for cx in 0..cursor_w {
+                let fx = left + cx;
+                if fx < 0 || fx >= frame_width as i32 {
+                    continue;
+                }
+
+                let byte_off = cy as usize * pitch + cx as usize / 8;
+                let bit_mask = 0x80u8 >> (cx as u32 % 8);
+                let and_bit = shape_buf.get(byte_off).map_or(1u8, |b| u8::from(b & bit_mask != 0));
+                let xor_bit = shape_buf
+                    .get(byte_off + cursor_h as usize * pitch)
+                    .map_or(0u8, |b| u8::from(b & bit_mask != 0));
+
+                let fp = fy as usize * frame_stride as usize + fx as usize * 4;
+                if fp + 2 >= frame.len() {
+                    continue;
+                }
+
+                // screen = (screen AND and) XOR xor  (每通道)
+                // and=0,xor=0 → 黑; and=1,xor=0 → 透明; and=0,xor=1 → 白; and=1,xor=1 → 反色
+                if and_bit == 0 {
+                    let val = xor_bit * 255;
+                    frame[fp] = val;
+                    frame[fp + 1] = val;
+                    frame[fp + 2] = val;
+                } else if xor_bit == 1 {
+                    frame[fp] = !frame[fp];
+                    frame[fp + 1] = !frame[fp + 1];
+                    frame[fp + 2] = !frame[fp + 2];
+                }
+            }
+        }
+    } else if shape_info.Type == DXGI_OUTDUPL_POINTER_SHAPE_TYPE_COLOR.0 as u32 {
+        // 32-bit BGRA，标准 Alpha 混合
+        let cursor_h = shape_info.Height as i32;
+        let cursor_w = shape_info.Width as i32;
+        let pitch = shape_info.Pitch as usize;
+
+        for cy in 0..cursor_h {
+            let fy = top + cy;
+            if fy < 0 || fy >= frame_height as i32 {
+                continue;
+            }
+            for cx in 0..cursor_w {
+                let fx = left + cx;
+                if fx < 0 || fx >= frame_width as i32 {
+                    continue;
+                }
+
+                let cp = cy as usize * pitch + cx as usize * 4;
+                let Some(&[cb, cg, cr, ca]) = shape_buf.get(cp..cp + 4)
+                    .and_then(|s| s.try_into().ok())
+                    .map(|a: &[u8; 4]| a)
+                else {
+                    continue;
+                };
+                if ca == 0 {
+                    continue;
+                }
+
+                let fp = fy as usize * frame_stride as usize + fx as usize * 4;
+                if fp + 2 >= frame.len() {
+                    continue;
+                }
+
+                if ca == 255 {
+                    frame[fp] = cb;
+                    frame[fp + 1] = cg;
+                    frame[fp + 2] = cr;
+                } else {
+                    let a = ca as u32;
+                    let ia = 255 - a;
+                    frame[fp] = ((cb as u32 * a + frame[fp] as u32 * ia) / 255) as u8;
+                    frame[fp + 1] = ((cg as u32 * a + frame[fp + 1] as u32 * ia) / 255) as u8;
+                    frame[fp + 2] = ((cr as u32 * a + frame[fp + 2] as u32 * ia) / 255) as u8;
+                }
+            }
+        }
+    } else if shape_info.Type == DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MASKED_COLOR.0 as u32 {
+        // alpha=0xFF → XOR 桌面像素；alpha=0x00 → 透明；其余 → Alpha 混合
+        let cursor_h = shape_info.Height as i32;
+        let cursor_w = shape_info.Width as i32;
+        let pitch = shape_info.Pitch as usize;
+
+        for cy in 0..cursor_h {
+            let fy = top + cy;
+            if fy < 0 || fy >= frame_height as i32 {
+                continue;
+            }
+            for cx in 0..cursor_w {
+                let fx = left + cx;
+                if fx < 0 || fx >= frame_width as i32 {
+                    continue;
+                }
+
+                let cp = cy as usize * pitch + cx as usize * 4;
+                let Some(&[cb, cg, cr, ca]) = shape_buf.get(cp..cp + 4)
+                    .and_then(|s| s.try_into().ok())
+                    .map(|a: &[u8; 4]| a)
+                else {
+                    continue;
+                };
+
+                let fp = fy as usize * frame_stride as usize + fx as usize * 4;
+                if fp + 2 >= frame.len() {
+                    continue;
+                }
+
+                match ca {
+                    0x00 => { /* 透明，不修改 */ }
+                    0xFF => {
+                        frame[fp] ^= cb;
+                        frame[fp + 1] ^= cg;
+                        frame[fp + 2] ^= cr;
+                    }
+                    a => {
+                        let a = a as u32;
+                        let ia = 255 - a;
+                        frame[fp] = ((cb as u32 * a + frame[fp] as u32 * ia) / 255) as u8;
+                        frame[fp + 1] = ((cg as u32 * a + frame[fp + 1] as u32 * ia) / 255) as u8;
+                        frame[fp + 2] = ((cr as u32 * a + frame[fp + 2] as u32 * ia) / 255) as u8;
+                    }
+                }
+            }
+        }
     }
 }
