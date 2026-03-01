@@ -2,11 +2,11 @@ use crate::transport::websocket::WebSocketServer;
 use axum::Json;
 use axum::Router;
 use axum::http::{HeaderValue, header};
-use axum::routing::{get, get_service};
+use axum::routing::{get, get_service, post};
 use hyper::server::conn::http1;
 use hyper_util::rt::TokioIo;
 use hyper_util::service::TowerToHyperService;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::TcpListener;
@@ -22,12 +22,47 @@ struct WebTransportHashResponse {
     value: Vec<u8>,
 }
 
-fn build_router(ws_server: Arc<WebSocketServer>, webtransport_cert_hash: Arc<Vec<u8>>) -> Router {
+#[derive(Deserialize)]
+struct WebRtcOfferRequest {
+    sdp: String,
+}
+
+#[derive(Serialize)]
+struct WebRtcAnswerResponse {
+    sdp: String,
+}
+
+fn build_router(
+    ws_server: Arc<WebSocketServer>,
+    webrtc_server: Arc<crate::transport::webrtc::WebRtcServer>,
+    webtransport_cert_hash: Arc<Vec<u8>>,
+) -> Router {
     let static_files =
         get_service(ServeDir::new("web/dist").append_index_html_on_directories(true));
     let hash_for_route = webtransport_cert_hash.clone();
 
-    Router::new()
+    // To cleanly share states and isolate them, we need to apply router combination strategies in Axum.
+    // Instead of chained .with_state on the same router (which requires state types to match),
+    // we use separate routers that are then `.merge()`d or nested.
+
+    let webrtc_router = Router::new()
+        .route(
+            "/webrtc/offer",
+            post(
+                move |axum::extract::State(server): axum::extract::State<
+                    Arc<crate::transport::webrtc::WebRtcServer>,
+                >,
+                      Json(payload): Json<WebRtcOfferRequest>| async move {
+                    match server.handle_offer(payload.sdp).await {
+                        Ok(sdp) => Ok(Json(WebRtcAnswerResponse { sdp })),
+                        Err(e) => Err((axum::http::StatusCode::INTERNAL_SERVER_ERROR, e)),
+                    }
+                },
+            ),
+        )
+        .with_state(webrtc_server);
+
+    let main_router = Router::new()
         .route("/ws", get(WebSocketServer::websocket_upgrade))
         .route(
             "/webtransport/hash",
@@ -41,7 +76,10 @@ fn build_router(ws_server: Arc<WebSocketServer>, webtransport_cert_hash: Arc<Vec
                 }
             }),
         )
-        .with_state(ws_server)
+        .with_state(ws_server);
+
+    main_router
+        .merge(webrtc_router)
         .fallback_service(static_files)
         .layer(SetResponseHeaderLayer::if_not_present(
             header::CONTENT_SECURITY_POLICY,
@@ -57,10 +95,11 @@ pub async fn run_server(
     addr: SocketAddr,
     acceptor: tokio_rustls::TlsAcceptor,
     ws_server: Arc<WebSocketServer>,
+    webrtc_server: Arc<crate::transport::webrtc::WebRtcServer>,
     webtransport_cert_hash: Arc<Vec<u8>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let listener = TcpListener::bind(addr).await?;
-    let app = build_router(ws_server, webtransport_cert_hash);
+    let app = build_router(ws_server, webrtc_server, webtransport_cert_hash);
     log::info!("HTTPS 服务器监听: https://{}", addr);
 
     loop {

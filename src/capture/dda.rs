@@ -117,6 +117,7 @@ pub struct DdaCapture {
     shader_rotation: u32,
     frame_texture: ID3D11Texture2D,
     frame_srv: ID3D11ShaderResourceView,
+    #[allow(dead_code)]
     composed_texture: ID3D11Texture2D,
     composed_rtv: ID3D11RenderTargetView,
     /// Video Processor 输出的 NV12 纹理（GPU 色彩转换结果）
@@ -128,8 +129,10 @@ pub struct DdaCapture {
     cursor_shape: Option<CursorShape>,
     cursor_visible: bool,
     cursor_pos: POINT,
+    #[allow(dead_code)]
     video_device: ID3D11VideoDevice,
     video_context: ID3D11VideoContext,
+    #[allow(dead_code)]
     video_processor_enum: ID3D11VideoProcessorEnumerator,
     video_processor: ID3D11VideoProcessor,
     vp_output_view: ID3D11VideoProcessorOutputView,

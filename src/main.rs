@@ -7,6 +7,7 @@ mod transport;
 
 use capture::dda::DdaCapture;
 use server::http::run_server;
+use transport::webrtc::WebRtcServer;
 use transport::websocket::WebSocketServer;
 use transport::webtransport::WebTransportServer;
 
@@ -43,7 +44,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         monitor_list_json.clone(),
         monitors.clone(),
     ));
-    let wt_server = Arc::new(WebTransportServer::new(monitor_list_json, monitors));
+    let wt_server = Arc::new(WebTransportServer::new(
+        monitor_list_json.clone(),
+        monitors.clone(),
+    ));
+    let webrtc_server = Arc::new(WebRtcServer::new(monitor_list_json, monitors));
 
     // 初始化 TLS
     let tls_config = server::tls::get_tls_config()?;
@@ -60,9 +65,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     log::info!("  Web 界面: https://localhost:8080");
     log::info!("  WebSocket: wss://localhost:8080/ws");
     log::info!("  WebTransport: https://localhost:8080/webtransport");
+    log::info!("  WebRTC: https://localhost:8080/webrtc/offer");
 
-    run_server(server_addr, tls_acceptor, ws_server, webtransport_cert_hash)
-        .await
-        .map_err(|e| -> Box<dyn std::error::Error> { e })?;
+    run_server(
+        server_addr,
+        tls_acceptor,
+        ws_server,
+        webrtc_server,
+        webtransport_cert_hash,
+    )
+    .await
+    .map_err(|e| -> Box<dyn std::error::Error> { e })?;
     Ok(())
 }

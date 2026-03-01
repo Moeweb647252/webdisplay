@@ -59,6 +59,8 @@ const FRAME_FLAGS = {
   KEYFRAME: 0x01,
 }
 
+const WEBRTC_OFFER_PATH = '/webrtc/offer'
+
 const PLAYER_GLOBAL_KEY = '__webdisplayPlayer'
 
 export const createUiState = () =>
@@ -105,6 +107,10 @@ export class UltraLowLatencyPlayer {
     this.webTransportWriter = null
     this.webTransportReader = null
     this.webTransportReadBuffer = new Uint8Array(0)
+
+    this.webrtc = null
+    this.webrtcDataChannel = null
+
     this.transportKind = null
     this.transportCloseHandled = false
     this.connected = false
@@ -220,6 +226,10 @@ export class UltraLowLatencyPlayer {
     this.webTransportWriter = null
     this.webTransportReader = null
     this.webTransportReadBuffer = new Uint8Array(0)
+
+    this.webrtc = null
+    this.webrtcDataChannel = null
+
     this.transportKind = null
   }
 
@@ -232,11 +242,19 @@ export class UltraLowLatencyPlayer {
       return !!(this.webTransport && this.webTransportWriter && this.webTransportReader)
     }
 
+    if (this.transportKind === 'webrtc') {
+      return this.webrtcDataChannel && this.webrtcDataChannel.readyState === 'open'
+    }
+
     return false
   }
 
   _isTransportActive() {
     if (this.ws && (this.ws.readyState === WebSocket.OPEN || this.ws.readyState === WebSocket.CONNECTING)) {
+      return true
+    }
+
+    if (this.webrtc && (this.webrtc.connectionState !== 'closed' && this.webrtc.connectionState !== 'failed')) {
       return true
     }
 
@@ -273,6 +291,13 @@ export class UltraLowLatencyPlayer {
         } catch (_) {
         }
       }
+    }
+
+    if (this.webrtcDataChannel) {
+      try { this.webrtcDataChannel.close() } catch (_) { }
+    }
+    if (this.webrtc) {
+      try { this.webrtc.close() } catch (_) { }
     }
   }
 
@@ -494,6 +519,21 @@ export class UltraLowLatencyPlayer {
       detail: '',
     })
 
+    const canUseWebRtc = typeof RTCPeerConnection !== 'undefined'
+    if (canUseWebRtc) {
+      const webrtcConnected = await this._connectWebRTC()
+      if (webrtcConnected) {
+        return
+      }
+
+      this._setConnectionState({
+        visible: true,
+        connected: false,
+        text: 'WebRTC 不可用，回退 WebTransport...',
+        detail: '',
+      })
+    }
+
     const canUseWebTransport = typeof WebTransport !== 'undefined' && location.protocol === 'https:'
     if (canUseWebTransport) {
       const webTransportConnected = await this._connectWebTransport()
@@ -601,6 +641,110 @@ export class UltraLowLatencyPlayer {
       }
 
       this._resetTransportState()
+      return false
+    }
+  }
+
+  async _connectWebRTC() {
+    console.log('尝试 WebRTC 连接...')
+    try {
+      this.webrtc = new RTCPeerConnection({
+        iceServers: []
+      })
+      this.transportKind = 'webrtc'
+
+      this.webrtcDataChannel = this.webrtc.createDataChannel('webdisplay', {
+        ordered: true
+      })
+      this.webrtcDataChannel.binaryType = 'arraybuffer'
+
+      return new Promise((resolve, reject) => {
+        const timeoutTimer = setTimeout(() => {
+          this._resetTransportState()
+          reject(new Error('WebRTC 连接超时'))
+        }, 3000)
+
+        this.webrtcDataChannel.onopen = () => {
+          clearTimeout(timeoutTimer)
+          if (this.transportKind !== 'webrtc') return
+
+          console.log('WebRTC DataChannel 已连接')
+          this.connected = true
+          this.autoReconnect = true
+          this._setConnectionState({
+            visible: false,
+            connected: true,
+            text: '已连接',
+            detail: '传输: WebRTC',
+          })
+          this._syncEncodingSettings(false)
+          this._requestKeyframe()
+          resolve(true)
+        }
+
+        this.webrtcDataChannel.onmessage = (event) => {
+          if (event.data instanceof ArrayBuffer) {
+            this._handleMessage(new Uint8Array(event.data))
+          }
+        }
+
+        this.webrtcDataChannel.onclose = () => {
+          if (this.transportKind === 'webrtc') {
+            console.log('WebRTC DataChannel 已断开')
+            this._onTransportDisconnected('WebRTC 连接断开')
+          }
+        }
+
+        this.webrtc.onicecandidate = (e) => {
+          if (e.candidate) {
+            console.log('Got Local ICE Candidate', e.candidate)
+          } else {
+            // ICE gathering finished
+            fetch(WEBRTC_OFFER_PATH, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ sdp: this.webrtc.localDescription.sdp })
+            })
+              .then(response => {
+                if (!response.ok) throw new Error('WebRTC signaling failed')
+                return response.json()
+              })
+              .then(data => {
+                return this.webrtc.setRemoteDescription(new RTCSessionDescription({
+                  type: 'answer',
+                  sdp: data.sdp
+                }))
+              })
+              .catch(error => {
+                clearTimeout(timeoutTimer)
+                console.warn('WebRTC 握手失败:', error)
+                if (this.webrtc) {
+                  try { this.webrtc.close() } catch (_) { }
+                }
+                this._resetTransportState()
+                resolve(false)
+              })
+          }
+        }
+
+        this.webrtc.onconnectionstatechange = () => {
+          console.log('WebRTC state:', this.webrtc.connectionState)
+          if (['failed', 'disconnected', 'closed'].includes(this.webrtc.connectionState)) {
+            if (this.transportKind === 'webrtc') {
+              this._onTransportDisconnected('WebRTC 连接断开')
+            }
+          }
+        }
+
+        this.webrtc.createOffer()
+          .then(offer => this.webrtc.setLocalDescription(offer))
+          .catch(error => {
+            console.warn('WebRTC createOffer 失败:', error)
+          })
+      })
+
+    } catch (e) {
+      console.warn('WebRTC 初始化失败:', e)
       return false
     }
   }
@@ -1491,6 +1635,16 @@ export class UltraLowLatencyPlayer {
       return true
     }
 
+    if (this.transportKind === 'webrtc' && this.webrtcDataChannel && this.webrtcDataChannel.readyState === 'open') {
+      try {
+        this.webrtcDataChannel.send(buffer)
+        return true
+      } catch (e) {
+        console.warn('WebRTC 发送失败:', e)
+        return false
+      }
+    }
+
     return false
   }
 
@@ -1512,11 +1666,43 @@ export class UltraLowLatencyPlayer {
   }
 
   _handleMessage(data) {
+    if (this.transportKind === 'webrtc') {
+      // Reassemble WebRTC chunked packets
+      // format: [4 bytes total_len][4 bytes offset][chunk_data]
+      const dataView = new DataView(data.buffer, data.byteOffset, data.byteLength)
+      if (data.byteLength < 8) return;
+      const totalLen = dataView.getUint32(0, true)
+      const offset = dataView.getUint32(4, true)
+
+      if (offset === 0) {
+        if (totalLen === data.byteLength - 8) {
+          // Single unfragmented packet
+          this.__handleCompleteMessage(new Uint8Array(data.buffer, data.byteOffset + 8, data.byteLength - 8))
+          return
+        }
+        this.webrtcChunkBuffer = new Uint8Array(totalLen)
+      }
+
+      if (this.webrtcChunkBuffer) {
+        this.webrtcChunkBuffer.set(new Uint8Array(data.buffer, data.byteOffset + 8, data.byteLength - 8), offset)
+        if (offset + (data.byteLength - 8) >= totalLen) {
+          const completePacket = this.webrtcChunkBuffer
+          this.webrtcChunkBuffer = null
+          this.__handleCompleteMessage(completePacket)
+        }
+      }
+      return
+    }
+
+    this.__handleCompleteMessage(data)
+  }
+
+  __handleCompleteMessage(data) {
     if (data.byteLength < HEADER_SIZE) {
       return
     }
 
-    const view = new DataView(data)
+    const view = new DataView(data.buffer, data.byteOffset, data.byteLength)
     const frameType = view.getUint8(0)
     const flags = view.getUint8(1)
     const sequence = view.getUint32(2, true)
@@ -1526,7 +1712,7 @@ export class UltraLowLatencyPlayer {
       return
     }
 
-    const payload = new Uint8Array(data, HEADER_SIZE, payloadLen)
+    const payload = new Uint8Array(data.buffer, data.byteOffset + HEADER_SIZE, payloadLen)
 
     if (frameType === FRAME_TYPE.MONITOR_LIST) {
       try {

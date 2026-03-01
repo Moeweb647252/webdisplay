@@ -4,23 +4,23 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-axum = { version = "0.8.7", features = ["ws"] }
-bitflags = "2.11.0"
-bytes = "1.11.1"
-env_logger = "0.11.9"
-ffmpeg-next = "8.0.0"
-futures-util = "0.3.32"
-hyper = { version = "1.8.1", features = ["full"] }
-hyper-util = { version = "0.1.20", features = ["full"] }
-log = "0.4.29"
-serde = { version = "1.0.228", features = ["derive"] }
-serde_json = "1.0.149"
-sha2 = "0.10.9"
-time = "0.3.47"
-tokio = { version = "1.49.0", features = ["full"] }
-tokio-util = { version = "0.7.18", features = ["codec"] }
-tower-http = { version = "0.6.6", features = ["fs", "set-header"] }
-windows = { version = "0.62.2", features = [
+axum = { version = "0.8", features = ["ws"] }
+bitflags = "2.11"
+bytes = "1.11"
+env_logger = "0.11"
+ffmpeg-next = "8.0"
+futures-util = "0.3"
+hyper = { version = "1.8", features = ["full"] }
+hyper-util = { version = "0.1", features = ["full"] }
+log = "0.4"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+time = "0.3"
+tokio = { version = "1.49", features = ["full"] }
+tokio-util = { version = "0.7", features = ["codec"] }
+tower-http = { version = "0.6", features = ["fs", "set-header"] }
+windows = { version = "0.62", features = [
     "Win32_Graphics_Dxgi",
     "Win32_Graphics_Dxgi_Common",
     "Win32_Graphics_Direct3D11",
@@ -32,10 +32,11 @@ windows = { version = "0.62.2", features = [
     "Win32_UI_WindowsAndMessaging",
     "Win32_Media",
 ] }
-tokio-rustls = { version = "0.26.1", default-features = false, features = [
+tokio-rustls = { version = "0.26", default-features = false, features = [
     "ring",
     "tls12",
 ] }
-rustls-pemfile = "2.2.0"
-rcgen = "0.14.7"
-wtransport = "0.7.0"
+rustls-pemfile = "2.2"
+rcgen = "0.14"
+wtransport = "0.7"
+webrtc = "0.17"
