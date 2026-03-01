@@ -79,7 +79,8 @@ impl TransportIo for WebSocketIo {
         timeout: Duration,
     ) -> Result<Option<Vec<u8>>, String> {
         loop {
-            let next_msg = match runtime.block_on(tokio::time::timeout(timeout, self.socket.next())) {
+            let next_msg = match runtime.block_on(tokio::time::timeout(timeout, self.socket.next()))
+            {
                 Ok(msg) => msg,
                 Err(_) => return Ok(None),
             };

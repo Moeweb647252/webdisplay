@@ -242,6 +242,7 @@ pub(crate) fn run_client_service<T: TransportIo>(
             .map_err(|e| e.to_string())?;
 
         if !frame_ready {
+            force_keyframe = requesting_kf; // 未捕获到帧，恢复关键帧请求
             pace_frame(frame_start, frame_interval);
             continue;
         }

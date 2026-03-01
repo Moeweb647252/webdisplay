@@ -374,15 +374,22 @@ impl DdaCapture {
 
             let video_processor = video_device.CreateVideoProcessor(&video_processor_enum, 0)?;
 
-            let color_space = D3D11_VIDEO_PROCESSOR_COLOR_SPACE {
+            let in_color_space = D3D11_VIDEO_PROCESSOR_COLOR_SPACE {
                 _bitfield: (0 & 1)
                     | ((0 & 1) << 1)
                     | ((1 & 1) << 2)
                     | ((0 & 1) << 3)
-                    | ((2 & 3) << 4),
+                    | ((2 & 3) << 4), // Nominal Range: 2 (0-255)
             };
-            video_context.VideoProcessorSetStreamColorSpace(&video_processor, 0, &color_space);
-            video_context.VideoProcessorSetOutputColorSpace(&video_processor, &color_space);
+            let out_color_space = D3D11_VIDEO_PROCESSOR_COLOR_SPACE {
+                _bitfield: (0 & 1)
+                    | ((0 & 1) << 1)
+                    | ((1 & 1) << 2)
+                    | ((0 & 1) << 3)
+                    | ((1 & 3) << 4), // Nominal Range: 1 (16-235)
+            };
+            video_context.VideoProcessorSetStreamColorSpace(&video_processor, 0, &in_color_space);
+            video_context.VideoProcessorSetOutputColorSpace(&video_processor, &out_color_space);
 
             // 输出视图（NV12 纹理）
             let output_view_desc = D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC {

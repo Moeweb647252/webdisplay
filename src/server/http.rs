@@ -23,7 +23,8 @@ struct WebTransportHashResponse {
 }
 
 fn build_router(ws_server: Arc<WebSocketServer>, webtransport_cert_hash: Arc<Vec<u8>>) -> Router {
-    let static_files = get_service(ServeDir::new("web/dist").append_index_html_on_directories(true));
+    let static_files =
+        get_service(ServeDir::new("web/dist").append_index_html_on_directories(true));
     let hash_for_route = webtransport_cert_hash.clone();
 
     Router::new()

@@ -457,6 +457,7 @@ export class UltraLowLatencyPlayer {
     })
 
     this.activeDecoderCodecId = codecId
+    this.awaitingKeyframe = true
     console.log(`${this._codecLabel(codecId)} 解码器已初始化 (硬件加速, 低延迟模式)`)
   }
 
@@ -841,10 +842,6 @@ export class UltraLowLatencyPlayer {
     this.encodingSettings = { ...normalized }
     this.ui.encodingDraft = { ...normalized }
 
-    if (codecChanged) {
-      this._switchDecoder(this.encodingSettings.codec)
-    }
-
     const syncOk = this._syncEncodingSettings(true)
     const codecLabel = this._codecLabel(this.encodingSettings.codec)
     if (syncOk) {
@@ -876,13 +873,11 @@ export class UltraLowLatencyPlayer {
       this.encodingSettings,
     )
 
-    const codecChanged = normalized.codec !== this.encodingSettings.codec
     this.encodingSettings = { ...normalized }
     this.ui.encodingDraft = { ...normalized }
 
-    if (codecChanged) {
-      this._switchDecoder(this.encodingSettings.codec)
-      this._requestKeyframe()
+    if (normalized.codec !== this.activeDecoderCodecId) {
+      this._switchDecoder(normalized.codec)
     }
   }
 
@@ -1531,6 +1526,13 @@ export class UltraLowLatencyPlayer {
 
     const isKeyframe = (flags & FRAME_FLAGS.KEYFRAME) !== 0
     this.stats.bitrateBytes += data.byteLength
+
+    if (this.awaitingKeyframe && !isKeyframe) {
+      return
+    }
+    if (isKeyframe) {
+      this.awaitingKeyframe = false
+    }
 
     const decodeStart = performance.now()
 

@@ -87,15 +87,19 @@ impl TransportIo for WebTransportIo {
         let mut scratch = [0u8; WT_READ_CHUNK_SIZE];
 
         loop {
-            let elapsed = loop_start.elapsed();
-            if elapsed >= timeout {
-                return Ok(None);
-            }
+            let wait = if timeout == Duration::ZERO {
+                Duration::ZERO
+            } else {
+                let elapsed = loop_start.elapsed();
+                if elapsed >= timeout {
+                    return Ok(None);
+                }
+                timeout - elapsed
+            };
 
-            let wait = timeout - elapsed;
-
-            let read_res = runtime
-                .block_on(async { tokio::time::timeout(wait, self.recv_stream.read(&mut scratch)).await });
+            let read_res = runtime.block_on(async {
+                tokio::time::timeout(wait, self.recv_stream.read(&mut scratch)).await
+            });
 
             let bytes_read = match read_res {
                 Ok(inner) => inner.map_err(|e| e.to_string())?,
