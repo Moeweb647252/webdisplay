@@ -249,7 +249,7 @@ export class UltraLowLatencyPlayer {
     }
 
     if (this.webTransportReader) {
-      this.webTransportReader.cancel(reason).catch(() => {})
+      this.webTransportReader.cancel(reason).catch(() => { })
       try {
         this.webTransportReader.releaseLock()
       } catch (_) {
@@ -257,7 +257,7 @@ export class UltraLowLatencyPlayer {
     }
 
     if (this.webTransportWriter) {
-      this.webTransportWriter.close().catch(() => {})
+      this.webTransportWriter.close().catch(() => { })
       try {
         this.webTransportWriter.releaseLock()
       } catch (_) {
@@ -580,14 +580,14 @@ export class UltraLowLatencyPlayer {
       console.warn('WebTransport 连接失败:', error)
 
       if (this.webTransportReader) {
-        this.webTransportReader.cancel('fallback to websocket').catch(() => {})
+        this.webTransportReader.cancel('fallback to websocket').catch(() => { })
         try {
           this.webTransportReader.releaseLock()
         } catch (_) {
         }
       }
       if (this.webTransportWriter) {
-        this.webTransportWriter.close().catch(() => {})
+        this.webTransportWriter.close().catch(() => { })
         try {
           this.webTransportWriter.releaseLock()
         } catch (_) {
@@ -1223,9 +1223,9 @@ export class UltraLowLatencyPlayer {
 
   _toggleFullscreen() {
     if (document.fullscreenElement) {
-      document.exitFullscreen().catch(() => {})
+      document.exitFullscreen().catch(() => { })
     } else {
-      document.documentElement.requestFullscreen().catch(() => {})
+      document.documentElement.requestFullscreen().catch(() => { })
     }
   }
 
@@ -1375,12 +1375,42 @@ export class UltraLowLatencyPlayer {
     return pos
   }
 
+  _getRenderRect() {
+    const rect = this.canvas.getBoundingClientRect()
+    if (rect.width <= 0 || rect.height <= 0 || this.canvas.width <= 0 || this.canvas.height <= 0) {
+      return rect
+    }
+
+    const canvasRatio = this.canvas.width / this.canvas.height
+    const rectRatio = rect.width / rect.height
+
+    let drawWidth = rect.width
+    let drawHeight = rect.height
+    let offsetX = 0
+    let offsetY = 0
+
+    if (canvasRatio > rectRatio) {
+      drawHeight = rect.width / canvasRatio
+      offsetY = (rect.height - drawHeight) / 2
+    } else {
+      drawWidth = rect.height * canvasRatio
+      offsetX = (rect.width - drawWidth) / 2
+    }
+
+    return {
+      left: rect.left + offsetX,
+      top: rect.top + offsetY,
+      width: drawWidth,
+      height: drawHeight,
+    }
+  }
+
   _normalizePointer(clientX, clientY) {
     if (typeof clientX !== 'number' || typeof clientY !== 'number') {
       return this.lastPointerPos
     }
 
-    const rect = this.canvas.getBoundingClientRect()
+    const rect = this._getRenderRect()
     if (rect.width <= 0 || rect.height <= 0) {
       return this.lastPointerPos
     }
@@ -1391,7 +1421,7 @@ export class UltraLowLatencyPlayer {
   }
 
   _normalizePointerDelta(movementX, movementY) {
-    const rect = this.canvas.getBoundingClientRect()
+    const rect = this._getRenderRect()
     if (rect.width <= 0 || rect.height <= 0) {
       return this.lastPointerPos
     }

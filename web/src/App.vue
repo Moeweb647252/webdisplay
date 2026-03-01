@@ -86,13 +86,8 @@ const codecLabel = (codecId) => {
       <div id="monitor-list">
         <div v-if="state.monitors.length === 0" class="monitor-empty">未检测到显示器</div>
 
-        <div
-          v-for="monitor in state.monitors"
-          :key="monitor.index"
-          class="monitor-card"
-          :class="{ active: monitor.index === state.activeMonitorIndex }"
-          @click="selectMonitor(monitor.index)"
-        >
+        <div v-for="monitor in state.monitors" :key="monitor.index" class="monitor-card"
+          :class="{ active: monitor.index === state.activeMonitorIndex }" @click="selectMonitor(monitor.index)">
           <div class="monitor-info">
             <div class="monitor-name">
               显示器 {{ monitor.index }}: {{ monitor.name }} {{ monitor.primary ? '(主屏)' : '' }}
@@ -127,14 +122,8 @@ const codecLabel = (codecId) => {
           <label for="encoding-bitrate">目标码率</label>
           <span class="encoding-label-value">{{ state.encodingDraft.bitrateMbps }} Mbps</span>
         </div>
-        <input
-          id="encoding-bitrate"
-          v-model.number="state.encodingDraft.bitrateMbps"
-          type="range"
-          min="2"
-          max="80"
-          step="1"
-        >
+        <input id="encoding-bitrate" v-model.number="state.encodingDraft.bitrateMbps" type="range" min="2" max="80"
+          step="1">
       </div>
 
       <div class="encoding-field">
@@ -142,14 +131,7 @@ const codecLabel = (codecId) => {
           <label for="encoding-fps">目标帧率</label>
           <span class="encoding-label-value">{{ state.encodingDraft.fps }} FPS</span>
         </div>
-        <input
-          id="encoding-fps"
-          v-model.number="state.encodingDraft.fps"
-          type="range"
-          min="24"
-          max="120"
-          step="6"
-        >
+        <input id="encoding-fps" v-model.number="state.encodingDraft.fps" type="range" min="24" max="120" step="6">
       </div>
 
       <div class="encoding-field">
@@ -157,14 +139,8 @@ const codecLabel = (codecId) => {
           <label for="encoding-keyint">关键帧间隔</label>
           <span class="encoding-label-value">{{ state.encodingDraft.keyframeInterval }} 秒</span>
         </div>
-        <input
-          id="encoding-keyint"
-          v-model.number="state.encodingDraft.keyframeInterval"
-          type="number"
-          min="1"
-          max="10"
-          step="1"
-        >
+        <input id="encoding-keyint" v-model.number="state.encodingDraft.keyframeInterval" type="number" min="1" max="10"
+          step="1">
       </div>
 
       <div class="encoding-actions">
@@ -211,6 +187,7 @@ body {
   height: 100%;
   display: block;
   cursor: none;
+  object-fit: contain;
 }
 
 #stream-canvas.show-local-cursor {
